@@ -18,6 +18,10 @@ Let’s finalize it.
 **SAS v1 — Systematic Spread Engine (Tradier Edition)**
 **Institutional-Grade Automated Options Trading Platform**
 
+This project is code name "GekkoWorks"
+
+Please make the cloudflare pages gekkoworks-ui, worker gekkoworks-api, and d1 gekkoworks-db
+
 ---
 
 ## 🚀 Overview
