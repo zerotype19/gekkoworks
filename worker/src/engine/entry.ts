@@ -23,6 +23,7 @@ import { getTradingMode, getStrategyThresholds } from '../core/config';
 import { getSetting } from '../db/queries';
 import { markTradeOpen, markTradeCancelled } from './lifecycle';
 import { notifyEntrySubmitted } from '../notifications/telegram';
+import { isRegimeConfidenceSufficient } from '../core/regimeConfidence';
 
 const MAX_PROPOSAL_AGE_MS = 15 * 60 * 1000; // 15 minutes
 const MAX_FILL_WAIT_MS = 30 * 1000; // 30 seconds total timeout (per Tradier-first spec)
@@ -155,7 +156,6 @@ export async function attemptEntryForLatestProposal(
     
     // 3.0. Check regime confidence (prevent trading in choppy/uncertain conditions)
     const { computeSMA20 } = await import('../core/trend');
-    const { isRegimeConfidenceSufficient } = await import('../core/regimeConfidence');
     const brokerForConfidence = new TradierClient(env);
     const underlying = await brokerForConfidence.getUnderlyingQuote(proposal.symbol);
     const sma20 = await computeSMA20(env, proposal.symbol);
@@ -197,6 +197,122 @@ export async function attemptEntryForLatestProposal(
       }));
       await updateProposalStatus(env, proposal.id, 'INVALIDATED');
       return { trade: null, reason: `Quantity ${quantity} exceeds maximum ${maxTradeQuantity}` };
+    }
+    
+    // 3.1b. Check concentration limits (prevent over-concentration in single symbol/side)
+    const { getOpenTrades: getOpenTradesForConcentration } = await import('../db/queries');
+    const openTradesForConcentration = await getOpenTradesForConcentration(env);
+    
+    // Determine option side from strategy
+    // For puts: short puts = bearish (BEAR_PUT_DEBIT), long puts = bullish (BULL_PUT_CREDIT)
+    // For calls: short calls = bearish (BEAR_CALL_CREDIT), long calls = bullish (BULL_CALL_DEBIT)
+    const isPutStrategy = proposal.strategy === 'BULL_PUT_CREDIT' || proposal.strategy === 'BEAR_PUT_DEBIT';
+    const isShortPremium = proposal.strategy === 'BULL_PUT_CREDIT' || proposal.strategy === 'BEAR_CALL_CREDIT';
+    const optionSide = isPutStrategy ? (isShortPremium ? 'short_puts' : 'long_puts') : (isShortPremium ? 'short_calls' : 'long_calls');
+    
+    // Check MAX_SPREADS_PER_SYMBOL (default: 3)
+    const maxSpreadsPerSymbol = parseInt(
+      (await getSetting(env, 'MAX_SPREADS_PER_SYMBOL')) || '3',
+      10
+    ) || 3;
+    const existingSpreadsForSymbol = openTradesForConcentration.filter(t => 
+      t.symbol === proposal.symbol && 
+      t.status !== 'CANCELLED' && 
+      t.status !== 'CLOSED'
+    );
+    if (existingSpreadsForSymbol.length >= maxSpreadsPerSymbol) {
+      console.log('[entry][risk][rejected]', JSON.stringify({
+        proposal_id: proposal.id,
+        reason: `Symbol ${proposal.symbol} already has ${existingSpreadsForSymbol.length} open spreads (max ${maxSpreadsPerSymbol})`,
+        symbol: proposal.symbol,
+        existing_count: existingSpreadsForSymbol.length,
+        max_spreads_per_symbol: maxSpreadsPerSymbol,
+      }));
+      await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+      return { trade: null, reason: `Symbol ${proposal.symbol} concentration limit reached (${existingSpreadsForSymbol.length}/${maxSpreadsPerSymbol})` };
+    }
+    
+    // Check MAX_QTY_PER_SYMBOL_PER_SIDE (default: 10 contracts)
+    const maxQtyPerSymbolPerSide = parseInt(
+      (await getSetting(env, 'MAX_QTY_PER_SYMBOL_PER_SIDE')) || '10',
+      10
+    ) || 10;
+    
+    // Sum quantity for existing trades with same symbol and same side
+    // For puts: check if strategy is put-based and same short/long direction
+    // For calls: check if strategy is call-based and same short/long direction
+    const existingQtyForSide = existingSpreadsForSymbol
+      .filter(t => {
+        const tIsPutStrategy = t.strategy === 'BULL_PUT_CREDIT' || t.strategy === 'BEAR_PUT_DEBIT';
+        const tIsShortPremium = t.strategy === 'BULL_PUT_CREDIT' || t.strategy === 'BEAR_CALL_CREDIT';
+        const tOptionSide = tIsPutStrategy ? (tIsShortPremium ? 'short_puts' : 'long_puts') : (tIsShortPremium ? 'short_calls' : 'long_calls');
+        return tOptionSide === optionSide;
+      })
+      .reduce((sum, t) => sum + (t.quantity || 1), 0);
+    
+    if (existingQtyForSide + quantity > maxQtyPerSymbolPerSide) {
+      console.log('[entry][risk][rejected]', JSON.stringify({
+        proposal_id: proposal.id,
+        reason: `Symbol ${proposal.symbol} ${optionSide} already has ${existingQtyForSide} contracts (adding ${quantity} would exceed ${maxQtyPerSymbolPerSide})`,
+        symbol: proposal.symbol,
+        option_side: optionSide,
+        existing_qty: existingQtyForSide,
+        new_qty: quantity,
+        total_would_be: existingQtyForSide + quantity,
+        max_qty_per_symbol_per_side: maxQtyPerSymbolPerSide,
+      }));
+      await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+      return { trade: null, reason: `Symbol ${proposal.symbol} ${optionSide} quantity limit reached (${existingQtyForSide + quantity}/${maxQtyPerSymbolPerSide})` };
+    }
+    
+    // 3.1c. Check for duplicate spread (same symbol, strategy, expiration, strikes)
+    // If found, we could merge into existing trade, but for now we'll just reject duplicates
+    const duplicateSpread = existingSpreadsForSymbol.find(t =>
+      t.strategy === proposal.strategy &&
+      t.expiration === proposal.expiration &&
+      t.short_strike === proposal.short_strike &&
+      t.long_strike === proposal.long_strike &&
+      (t.status === 'OPEN' || t.status === 'ENTRY_PENDING')
+    );
+    
+    if (duplicateSpread) {
+      // Check if we can increase quantity on existing spread instead of creating duplicate
+      const maxQtyPerSpread = parseInt(
+        (await getSetting(env, 'MAX_QTY_PER_SPREAD')) || '10',
+        10
+      ) || 10;
+      const currentQty = duplicateSpread.quantity || 1;
+      
+      if (currentQty + quantity <= maxQtyPerSpread) {
+        // We could merge here, but for now we'll just reject to keep it simple
+        // TODO: Implement merge logic to increase quantity on existing trade
+        console.log('[entry][risk][rejected]', JSON.stringify({
+          proposal_id: proposal.id,
+          reason: `Duplicate spread already exists (trade_id: ${duplicateSpread.id}, qty: ${currentQty})`,
+          symbol: proposal.symbol,
+          strategy: proposal.strategy,
+          expiration: proposal.expiration,
+          short_strike: proposal.short_strike,
+          long_strike: proposal.long_strike,
+          existing_trade_id: duplicateSpread.id,
+          existing_qty: currentQty,
+          note: 'Merging duplicate spreads not yet implemented - rejecting to prevent over-concentration',
+        }));
+        await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+        return { trade: null, reason: `Duplicate spread already exists (trade ${duplicateSpread.id})` };
+      } else {
+        // Existing spread is already at max quantity
+        console.log('[entry][risk][rejected]', JSON.stringify({
+          proposal_id: proposal.id,
+          reason: `Duplicate spread exists and is at max quantity (${currentQty}/${maxQtyPerSpread})`,
+          symbol: proposal.symbol,
+          existing_trade_id: duplicateSpread.id,
+          existing_qty: currentQty,
+          max_qty_per_spread: maxQtyPerSpread,
+        }));
+        await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+        return { trade: null, reason: `Duplicate spread at max quantity (${currentQty}/${maxQtyPerSpread})` };
+      }
     }
     
     const isDebitSpreadForRisk = proposal.strategy === 'BULL_CALL_DEBIT' || proposal.strategy === 'BEAR_PUT_DEBIT';
