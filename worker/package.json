@@ -1,0 +1,25 @@
+{
+  "name": "gekkoworks-api",
+  "version": "1.0.0",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "validate": "npm run validate:schema && npm run validate:api && npm run typecheck",
+    "validate:schema": "tsx src/scripts/validate-schema.ts",
+    "validate:api": "tsx src/scripts/validate-api-params.ts",
+    "predeploy": "npm run validate"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "SAS v1 - Systematic Spread Engine (Tradier Edition)",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251120.0",
+    "@types/node": "^24.10.1",
+    "esbuild": "^0.27.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  }
+}

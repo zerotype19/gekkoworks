@@ -1,0 +1,50 @@
+name = "gekkoworks-api"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[vars]
+TRADIER_ENV = "sandbox"
+
+# These will be set via `wrangler secret put`:
+# TRADIER_API_TOKEN
+# TRADIER_ACCOUNT_ID
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gekkoworks_db"
+database_id = "3c93b6f9-db23-4944-b194-ae9e91ff42ac"
+
+[[kv_namespaces]]
+binding = "SYNC_CACHE"
+id = "979c13825926448b9856b11b0a36f47a"
+preview_id = "ecbb218170114ec7a732dbfa1251aff5"
+
+[triggers]
+crons = [
+  # Premarket health checks (around 8:00 ET)
+  "0 13 * * MON-FRI",
+
+  # Proposal + entry cycle – every 1 minute during RTH (9:30–16:00 ET)
+  # 14:30–14:59 UTC  →  9:30–9:59 ET
+  "30-59 14 * * MON-FRI",
+  # 15:00–20:59 UTC  →  10:00–15:59 ET
+  "*/1 15-20 * * MON-FRI",
+  # 21:00 UTC        →  16:00 ET (final tick at cash close)
+  "0 21 * * MON-FRI",
+
+  # Monitor / close-rules cron: runs every minute during market hours (ET).
+  # Monitoring + exits – every 1 minute during RTH (offset by 30 seconds to avoid collision)
+  "1-59/1 14-20 * * MON-FRI",
+
+  # Account snapshots – every 1 minute during market hours (14:00–21:59 UTC)
+  # Syncs positions, orders, and balances to keep all sync freshness timestamps updated
+  "*/1 14-21 * * MON-FRI",
+
+  # Orphaned order cleanup – runs 3 times per day to identify and log orphaned orders
+  # Runs at 10:00 ET (14:00 UTC), 13:00 ET (17:00 UTC), and 16:00 ET (20:00 UTC)
+  "0 14 * * MON-FRI",
+  "0 17 * * MON-FRI",
+  "0 20 * * MON-FRI",
+]
+
