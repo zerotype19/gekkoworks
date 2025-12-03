@@ -54,76 +54,9 @@ export async function handleDebugUpdateQuantities(
     // 3. Build a map of (symbol, expiration, short_strike, long_strike) -> quantity
     const positionMap = new Map<string, number>();
     
-    for (const pos of positions) {
-      const parsed = parseOptionSymbol(pos.symbol);
-      if (!parsed || parsed.type !== 'put') continue;
-      
-      // For each position, we need to find matching trades
-      // We'll match by expiration and strike
-      const key = `${parsed.expiration}-${parsed.strike}`;
-      const absQty = Math.abs(pos.quantity);
-      
-      // Store the max quantity we see for this strike/expiration
-      const existing = positionMap.get(key);
-      if (!existing || absQty > existing) {
-        positionMap.set(key, absQty);
-      }
-    }
-    
-    // 4. Group positions into spreads to get actual quantities
-    const spreads: Array<{
-      symbol: string;
-      expiration: string;
-      short_strike: number;
-      long_strike: number;
-      quantity: number;
-    }> = [];
-    
-    // Group by expiration
-    const byExpiration = new Map<string, typeof positions>();
-    for (const pos of positions) {
-      const parsed = parseOptionSymbol(pos.symbol);
-      if (!parsed || parsed.type !== 'put') continue;
-      
-      if (!byExpiration.has(parsed.expiration)) {
-        byExpiration.set(parsed.expiration, []);
-      }
-      byExpiration.get(parsed.expiration)!.push(pos);
-    }
-    
-    // Find matching spreads
-    for (const [expiration, expPositions] of byExpiration.entries()) {
-      const shortPuts = expPositions.filter(p => {
-        const parsed = parseOptionSymbol(p.symbol);
-        return parsed && parsed.type === 'put' && p.quantity < 0;
-      });
-      
-      const longPuts = expPositions.filter(p => {
-        const parsed = parseOptionSymbol(p.symbol);
-        return parsed && parsed.type === 'put' && p.quantity > 0;
-      });
-      
-      for (const shortPut of shortPuts) {
-        const shortParsed = parseOptionSymbol(shortPut.symbol);
-        if (!shortParsed) continue;
-        
-        for (const longPut of longPuts) {
-          const longParsed = parseOptionSymbol(longPut.symbol);
-          if (!longParsed) continue;
-          
-          const width = shortParsed.strike - longParsed.strike;
-          if (width === 5 && Math.abs(shortPut.quantity) === longPut.quantity) {
-            spreads.push({
-              symbol: shortParsed.underlying,
-              expiration,
-              short_strike: shortParsed.strike,
-              long_strike: longParsed.strike,
-              quantity: Math.abs(shortPut.quantity),
-            });
-          }
-        }
-      }
-    }
+    // 4. Use groupPositionsIntoSpreads from portfolioSync (handles all strategy types)
+    const { groupPositionsIntoSpreads } = await import('../engine/portfolioSync');
+    const spreads = groupPositionsIntoSpreads(positions);
     
     // 5. Update trades with correct quantities
     const updates: Array<{ tradeId: string; oldQuantity: number; newQuantity: number }> = [];
@@ -138,12 +71,13 @@ export async function handleDebugUpdateQuantities(
       
       if (matchingSpread) {
         const currentQuantity = trade.quantity ?? 1;
-        if (currentQuantity !== matchingSpread.quantity) {
-          await updateTrade(env, trade.id, { quantity: matchingSpread.quantity });
+        const spreadQuantity = matchingSpread.short_quantity; // Should equal long_quantity for valid spread
+        if (currentQuantity !== spreadQuantity) {
+          await updateTrade(env, trade.id, { quantity: spreadQuantity });
           updates.push({
             tradeId: trade.id,
             oldQuantity: currentQuantity,
-            newQuantity: matchingSpread.quantity,
+            newQuantity: spreadQuantity,
           });
         }
       }
@@ -164,7 +98,7 @@ export async function handleDebugUpdateQuantities(
           expiration: s.expiration,
           short_strike: s.short_strike,
           long_strike: s.long_strike,
-          quantity: s.quantity,
+          quantity: s.short_quantity, // Use short_quantity (should equal long_quantity)
         })),
         updates: updates,
       }),

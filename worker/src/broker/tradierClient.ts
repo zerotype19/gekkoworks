@@ -13,10 +13,11 @@
 
 import type { Env } from '../env';
 
-const TRADIER_TIMEOUT_MS = 10000; // 10 seconds (default) - increased for reliability
+const TRADIER_TIMEOUT_MS = 10000; // 10 seconds (default)
 const TRADIER_ORDERS_TIMEOUT_MS = 15000; // 15 seconds for bulk order operations
-const TRADIER_POSITIONS_TIMEOUT_MS = 10000; // 10 seconds for positions sync
-const TRADIER_MAX_RETRIES = 2; // Maximum retries for transient failures
+const TRADIER_POSITIONS_TIMEOUT_MS = 30000; // 30 seconds for positions sync (Tradier sandbox can be slow)
+const TRADIER_CHAINS_TIMEOUT_MS = 30000; // 30 seconds for option chains (Tradier sandbox can be slow)
+const TRADIER_MAX_RETRIES = 2; // Maximum retries for transient failures (total attempts = 3: initial + 2 retries)
 const TRADIER_RETRY_DELAY_MS = 1000; // Initial retry delay (1 second)
 import type {
   BrokerClient,
@@ -49,9 +50,15 @@ export class TradierClient implements BrokerClient {
       throw new Error(`Invalid TRADIER_ENV: ${env.TRADIER_ENV}`);
     }
 
-    // TODO: Replace with actual API token when available
-    this.apiToken = env.TRADIER_API_TOKEN || 'PLACEHOLDER_API_TOKEN';
-    this.accountId = env.TRADIER_ACCOUNT_ID || 'PLACEHOLDER_ACCOUNT_ID';
+    // Fail fast if credentials are missing - don't silently use placeholders
+    if (!env.TRADIER_API_TOKEN) {
+      throw new Error('TRADIER_API_TOKEN is required');
+    }
+    if (!env.TRADIER_ACCOUNT_ID) {
+      throw new Error('TRADIER_ACCOUNT_ID is required');
+    }
+    this.apiToken = env.TRADIER_API_TOKEN;
+    this.accountId = env.TRADIER_ACCOUNT_ID;
   }
 
   /**
@@ -259,7 +266,9 @@ export class TradierClient implements BrokerClient {
       const encodedExpiration = encodeURIComponent(expiration);
       const data = await this.request(
         'GET',
-        `/markets/options/chains?symbol=${encodedSymbol}&expiration=${encodedExpiration}&greeks=true`
+        `/markets/options/chains?symbol=${encodedSymbol}&expiration=${encodedExpiration}&greeks=true`,
+        undefined,
+        TRADIER_CHAINS_TIMEOUT_MS
       );
       
       const rawOptions = this.normalizeOptionResponse(data);
@@ -408,11 +417,12 @@ export class TradierClient implements BrokerClient {
         } else if (params.strategy.endsWith('_DEBIT')) {
           baseType = 'debit';
         } else {
-          // Fallback: if strategy doesn't match pattern, default to credit (safer for most spreads)
-          console.warn('[broker][placeSpreadOrder] Unknown strategy pattern, defaulting to credit', JSON.stringify({
+          // Unknown strategy pattern - fail fast to prevent incorrect order types
+          const msg = `Unknown strategy pattern for placeSpreadOrder: ${params.strategy}`;
+          console.error('[broker][placeSpreadOrder][unknown-strategy]', JSON.stringify({
             strategy: params.strategy,
           }));
-          baseType = 'credit';
+          throw new Error(msg);
         }
         
         // For EXIT orders, flip the type:
@@ -450,18 +460,62 @@ export class TradierClient implements BrokerClient {
       const formattedPrice = parseFloat(params.limit_price.toFixed(2));
       body.append('price', formattedPrice.toString());
 
+      // 6. Validate leg sides match order side (ENTRY vs EXIT)
+      // CRITICAL: Entry orders must use _to_open, exit orders must use _to_close
+      const leg0Side = params.legs[0].side.toLowerCase();
+      const leg1Side = params.legs[1].side.toLowerCase();
+      
+      if (isExit) {
+        // Exit orders MUST use _to_close
+        if (!leg0Side.includes('_to_close') || !leg1Side.includes('_to_close')) {
+          const error = `EXIT order has invalid leg sides: leg0=${leg0Side}, leg1=${leg1Side}. EXIT orders must use buy_to_close or sell_to_close.`;
+          console.error('[broker][placeSpreadOrder][validation-error]', JSON.stringify({
+            side: params.side,
+            strategy: params.strategy,
+            leg0: { option_symbol: params.legs[0].option_symbol, side: leg0Side },
+            leg1: { option_symbol: params.legs[1].option_symbol, side: leg1Side },
+            error,
+          }));
+          throw new Error(error);
+        }
+      } else {
+        // Entry orders MUST use _to_open
+        if (!leg0Side.includes('_to_open') || !leg1Side.includes('_to_open')) {
+          const error = `ENTRY order has invalid leg sides: leg0=${leg0Side}, leg1=${leg1Side}. ENTRY orders must use buy_to_open or sell_to_open.`;
+          console.error('[broker][placeSpreadOrder][validation-error]', JSON.stringify({
+            side: params.side,
+            strategy: params.strategy,
+            leg0: { option_symbol: params.legs[0].option_symbol, side: leg0Side },
+            leg1: { option_symbol: params.legs[1].option_symbol, side: leg1Side },
+            error,
+          }));
+          throw new Error(error);
+        }
+      }
+
+      // CRITICAL: Assert leg quantity equality - spread orders require symmetric legs
+      if (params.legs[0].quantity !== params.legs[1].quantity) {
+        throw new Error(`Mismatched leg quantities in spread: ${params.legs[0].quantity} vs ${params.legs[1].quantity}`);
+      }
+
       // 6. Leg 0 - option_symbol, side, quantity
       body.append('option_symbol[0]', params.legs[0].option_symbol);
-      body.append('side[0]', params.legs[0].side.toLowerCase());
+      body.append('side[0]', leg0Side);
       body.append('quantity[0]', params.legs[0].quantity.toString());
 
       // 7. Leg 1 - option_symbol, side, quantity
       body.append('option_symbol[1]', params.legs[1].option_symbol);
-      body.append('side[1]', params.legs[1].side.toLowerCase());
+      body.append('side[1]', leg1Side);
       body.append('quantity[1]', params.legs[1].quantity.toString());
       
       // 8. tag - for tracking
       body.append('tag', params.tag);
+      
+      // 9. client_order_id - for explicit linkage (if provided)
+      // Tradier supports client_order_id parameter for tracking orders
+      if (params.client_order_id) {
+        body.append('client_order_id', params.client_order_id);
+      }
       
       // Log the exact request body for debugging
       const requestBodyEntries: Record<string, string> = {};
@@ -521,7 +575,7 @@ export class TradierClient implements BrokerClient {
         status: 'NEW',
         avg_fill_price: null,
         filled_quantity: 0,
-        remaining_quantity: params.legs[0].quantity, // Assuming both legs same quantity
+        remaining_quantity: params.legs[0].quantity, // Both legs have same quantity (validated above)
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       };
@@ -705,7 +759,29 @@ export class TradierClient implements BrokerClient {
       );
 
       // Parse order from response - structure may vary
-      const order = data.order || data;
+      // Tradier can nest order in: data.order, data, or data.orders.order
+      let order: any;
+      if (data.order) {
+        order = data.order;
+      } else if (data.orders?.order) {
+        order = Array.isArray(data.orders.order) ? data.orders.order[0] : data.orders.order;
+      } else {
+        order = data;
+      }
+      
+      // Log full response structure when status is missing or UNKNOWN for debugging
+      if (!order.status) {
+        console.warn('[broker][getOrder][missing-status]', JSON.stringify({
+          order_id: orderId,
+          response_structure: {
+            has_order: !!data.order,
+            has_orders: !!data.orders,
+            order_keys: order ? Object.keys(order) : [],
+            raw_response_sample: JSON.stringify(data).slice(0, 500),
+          },
+          note: 'Order status is missing from Tradier response',
+        }));
+      }
       
       // Reduced logging - only log rejections/cancellations (not every order check)
       if (order.status?.toLowerCase() === 'rejected' || order.status?.toLowerCase() === 'cancelled') {
@@ -722,23 +798,64 @@ export class TradierClient implements BrokerClient {
         'filled': 'FILLED',
         'open': 'OPEN',
         'cancelled': 'CANCELLED',
+        'canceled': 'CANCELLED', // Alternative spelling
         'rejected': 'REJECTED',
         'expired': 'EXPIRED',
         'pending': 'NEW',
         'partially_filled': 'OPEN',
         'partial': 'OPEN',
+        'new': 'NEW',
+        'submitted': 'OPEN', // Submitted orders are effectively open
+        'working': 'OPEN', // Working orders are open
       };
 
-      const status: BrokerOrderStatus = statusMap[order.status?.toLowerCase()] || 'UNKNOWN';
+        const rawStatus = order.status?.toLowerCase();
+        const status: BrokerOrderStatus = statusMap[rawStatus] || 'UNKNOWN';
+        
+        // Log FULL response structure if it maps to UNKNOWN so we can diagnose mapping issues
+        if (status === 'UNKNOWN') {
+          console.warn('[broker][getOrder][unknown-status][full-response]', JSON.stringify({
+            order_id: orderId,
+            raw_tradier_status: order.status,
+            raw_status_lowercase: rawStatus,
+            full_order_object: {
+              id: order.id,
+              status: order.status,
+              status_description: order.status_description,
+              type: order.type,
+              class: order.class,
+              created_at: order.created_at || order.create_date,
+              updated_at: order.updated_at || order.transaction_date,
+              filled_quantity: order.filled_quantity,
+              remaining_quantity: order.remaining_quantity,
+              avg_fill_price: order.avg_fill_price,
+            },
+            response_structure: {
+              has_data_order: !!data.order,
+              has_data_orders: !!data.orders,
+              top_level_keys: Object.keys(data),
+            },
+            note: 'Tradier returned an unmapped status - full response logged for diagnosis',
+          }));
+        }
+        
+        // Extract client_order_id and tag if available (Tradier may return these)
+        const clientOrderId = order.client_order_id || order.clientOrderId || null;
+        const tag = order.tag || null;
 
-      // Calculate avg_fill_price
+        // Calculate avg_fill_price
       // For multileg credit spreads, Tradier returns avg_fill_price as negative (debit)
       // We need to convert to positive (credit) for entry_price
       let avgFillPrice: number | null = null;
       if (order.avg_fill_price != null) {
         const rawPrice = parseFloat(order.avg_fill_price);
-        // Tradier can return negative avg_fill_price for net credits; normalize to absolute
-        avgFillPrice = Math.abs(rawPrice);
+        // For credit spreads, Tradier returns negative values - normalize to positive
+        // For debit spreads, keep as-is (already positive)
+        if (order.type === 'credit' && rawPrice < 0) {
+          avgFillPrice = Math.abs(rawPrice);
+        } else {
+          avgFillPrice = rawPrice;
+        }
       } else if (order.leg && Array.isArray(order.leg)) {
         // For multileg orders, compute net credit/debit from legs
         // Tradier nests legs in 'leg' array (not 'legs')
@@ -1103,19 +1220,40 @@ export class TradierClient implements BrokerClient {
           'filled': 'FILLED',
           'open': 'OPEN',
           'cancelled': 'CANCELLED',
+          'canceled': 'CANCELLED', // Alternative spelling
           'rejected': 'REJECTED',
           'expired': 'EXPIRED',
           'pending': 'NEW',
           'partially_filled': 'OPEN',
           'partial': 'OPEN',
+          'new': 'NEW',
+          'submitted': 'OPEN', // Submitted orders are effectively open
+          'working': 'OPEN', // Working orders are open
         };
 
-        const status: BrokerOrderStatus = statusMap[order.status?.toLowerCase()] || 'UNKNOWN';
+        const rawStatus = order.status?.toLowerCase();
+        const status: BrokerOrderStatus = statusMap[rawStatus] || 'UNKNOWN';
+        
+        // Log raw status if it maps to UNKNOWN (only log first few to avoid spam)
+        if (status === 'UNKNOWN' && normalized.indexOf(order) < 3) {
+          console.warn('[broker][getAllOrders][unknown-status]', JSON.stringify({
+            order_id: order.id,
+            raw_tradier_status: order.status,
+            raw_status_lowercase: rawStatus,
+            note: 'Tradier returned an unmapped status - check status mapping',
+          }));
+        }
 
         let avgFillPrice: number | null = null;
         if (order.avg_fill_price != null) {
           const rawPrice = parseFloat(order.avg_fill_price);
-          avgFillPrice = Math.abs(rawPrice);
+          // For credit spreads, Tradier returns negative values - normalize to positive
+          // For debit spreads, keep as-is (already positive)
+          if (order.type === 'credit' && rawPrice < 0) {
+            avgFillPrice = Math.abs(rawPrice);
+          } else {
+            avgFillPrice = rawPrice;
+          }
         }
 
         return {
@@ -1131,7 +1269,7 @@ export class TradierClient implements BrokerClient {
 
       const durationMs = Date.now() - start;
       await logBrokerEvent(this.env, {
-        operation: 'GET_ALL_ORDERS',
+        operation: 'GET_OPEN_ORDERS',
         statusCode: 200,
         ok: true,
         durationMs,
@@ -1145,7 +1283,7 @@ export class TradierClient implements BrokerClient {
       const errorMessage = raw.length > 200 ? raw.slice(0, 200) + '…' : raw;
 
       await logBrokerEvent(this.env, {
-        operation: 'GET_ALL_ORDERS',
+        operation: 'GET_OPEN_ORDERS',
         ok: false,
         durationMs,
         errorMessage,
@@ -1261,14 +1399,33 @@ export class TradierClient implements BrokerClient {
           'filled': 'FILLED',
           'open': 'OPEN',
           'cancelled': 'CANCELLED',
+          'canceled': 'CANCELLED', // Alternative spelling
           'rejected': 'REJECTED',
           'expired': 'EXPIRED',
           'pending': 'NEW',
           'partially_filled': 'OPEN',
           'partial': 'OPEN',
+          'new': 'NEW',
+          'submitted': 'OPEN', // Submitted orders are effectively open
+          'working': 'OPEN', // Working orders are open
         };
 
-        const status: BrokerOrderStatus = statusMap[order.status?.toLowerCase()] || 'UNKNOWN';
+        const rawStatus = order.status?.toLowerCase();
+        const status: BrokerOrderStatus = statusMap[rawStatus] || 'UNKNOWN';
+        
+        // Log raw status if it maps to UNKNOWN (only log first few to avoid spam)
+        if (status === 'UNKNOWN' && normalized.indexOf(order) < 3) {
+          console.warn('[broker][getAllOrders][unknown-status]', JSON.stringify({
+            order_id: order.id,
+            raw_tradier_status: order.status,
+            raw_status_lowercase: rawStatus,
+            note: 'Tradier returned an unmapped status - check status mapping',
+          }));
+        }
+        
+        // Extract client_order_id and tag if available (Tradier may return these)
+        const clientOrderId = order.client_order_id || order.clientOrderId || null;
+        const tag = order.tag || null;
 
         // Calculate avg_fill_price
         // For multileg credit spreads, Tradier returns avg_fill_price as negative (debit)

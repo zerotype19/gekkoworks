@@ -31,7 +31,9 @@ export type ExitReason =
   | 'BROKER_ALREADY_FLAT'
   | 'QUANTITY_MISMATCH'
   | 'MAX_EXIT_ATTEMPTS'
-  | 'MANUAL_CLOSE';
+  | 'MANUAL_CLOSE'
+  | 'PHANTOM_TRADE'
+  | 'NORMAL_EXIT';
 
 export interface TradeRow {
   id: string;                  // UUID
@@ -66,9 +68,15 @@ export interface TradeRow {
   max_seen_profit_fraction?: number | null;
   // Implied volatility at entry (for IV crush exit logic)
   iv_entry?: number | null;
+  // Origin: 'ENGINE' | 'IMPORTED' | 'MANUAL'
+  origin?: string;
+  // Managed: 1 = engine can auto-monitor/exit, 0 = engine must ignore
+  managed?: number;
 }
 
 export type ProposalStatus = 'READY' | 'INVALIDATED' | 'CONSUMED';
+
+export type ProposalKind = 'ENTRY' | 'EXIT';
 
 export interface ProposalRow {
   id: string;                   // UUID
@@ -91,11 +99,56 @@ export interface ProposalRow {
 
   created_at: string;           // ISO datetime
   status: ProposalStatus;
+  
+  // New fields for explicit linkage
+  kind?: ProposalKind | null;   // 'ENTRY' | 'EXIT'
+  linked_trade_id?: string | null;  // nullable - for exit proposals
+  client_order_id?: string | null;  // nullable - the client_order_id we sent to Tradier
+}
+
+export type OrderStatus = 'PENDING' | 'PLACED' | 'PARTIAL' | 'FILLED' | 'CANCELLED' | 'REJECTED';
+
+export type OrderSide = 'ENTRY' | 'EXIT';
+
+export interface OrderRow {
+  id: string;                   // UUID
+  proposal_id: string;          // NOT NULL - every order is linked to a proposal
+  trade_id: string | null;      // nullable - populated once trade exists
+  client_order_id: string;      // UNIQUE - the ID we send to Tradier
+  tradier_order_id: string | null;  // Tradier's order ID (from their response)
+  side: OrderSide;              // 'ENTRY' | 'EXIT'
+  status: OrderStatus;          // 'PENDING' | 'PLACED' | 'PARTIAL' | 'FILLED' | 'CANCELLED' | 'REJECTED'
+  avg_fill_price: number | null;
+  filled_quantity: number;
+  remaining_quantity: number;
+  snapshot_id: string | null;   // Links to tradier_snapshots.id
+  created_at: string;           // ISO datetime
+  updated_at: string;           // ISO datetime
 }
 
 export interface SettingRow {
   key: string;
   value: string;
+}
+
+// ============================================================================
+// Portfolio Positions (Pure mirror of Tradier positions)
+// ============================================================================
+
+export interface PortfolioPositionRow {
+  id: string;                          // UUID
+  symbol: string;                      // Option symbol (e.g., 'SPY251212P00645000')
+  expiration: string;                  // 'YYYY-MM-DD'
+  option_type: 'call' | 'put';
+  strike: number;
+  side: 'long' | 'short';
+  quantity: number;                    // Always >= 0 (absolute value)
+  cost_basis_per_contract: number | null;
+  last_price: number | null;
+  bid: number | null;                  // Current bid price (from option chain, updated during portfolio sync)
+  ask: number | null;                  // Current ask price (from option chain, updated during portfolio sync)
+  snapshot_id: string | null;           // Links to tradier_snapshots.id
+  updated_at: string;                  // ISO timestamp
 }
 
 export interface RiskStateRow {
@@ -143,6 +196,13 @@ export interface AccountSnapshotRow {
   unrealized_pnl_open: number | null;
 
   source: string;
+}
+
+export interface DailySummaryRow {
+  date: string;              // YYYY-MM-DD in ET
+  generated_at: string;       // ISO timestamp
+  summary_data: string;       // JSON string of the summary
+  created_at: string;         // ISO timestamp
 }
 
 // ============================================================================
@@ -194,6 +254,8 @@ export interface BrokerOrder {
   remaining_quantity: number;
   created_at: string | null;
   updated_at: string | null;
+  client_order_id?: string | null;  // Optional - Tradier may return this if we sent it
+  tag?: string | null;              // Optional - Tradier may return the tag we sent
 }
 
 export type SpreadSide = 'ENTRY' | 'EXIT';
@@ -212,6 +274,7 @@ export interface PlaceSpreadOrderParams {
   tag: string;              // 'GEKKOWORKS-ENTRY' or 'GEKKOWORKS-EXIT'
   strategy?: string;        // Optional: 'BULL_PUT_CREDIT' | 'BULL_CALL_DEBIT' | etc. - used to determine order type
   order_type?: 'limit' | 'market';  // Optional: 'limit' (default) or 'market' for forced closes
+  client_order_id?: string;  // Optional: client order ID for tracking
 }
 
 export interface BrokerPosition {
@@ -252,68 +315,34 @@ export interface CandidateMetrics {
   long_strike: number;
   width: number;
 
-  credit: number;
+  // Pricing
+  short_bid: number;
+  short_ask: number;
+  long_bid: number;
+  long_ask: number;
 
-  ivr: number;
-  rv_30d: number;
-  iv_30d: number;
+  // Greeks
+  short_delta: number | null;
+  long_delta: number | null;
+  short_iv: number | null;
+  long_iv: number | null;
 
-  // Vertical skew between short and long leg IVs (long_iv - short_iv, 0–1 range)
-  vertical_skew: number;
-  // Alias / convenience field for vertical skew (same value as vertical_skew)
-  verticalSkew: number;
-
-  // Per-leg liquidity as percentage bid/ask spreads (e.g. 0.01 = 1%)
-  short_pct_spread: number;
-  long_spread?: number;
-  long_pct_spread: number;
-  term_structure: number;
-
-  delta_short: number;
-  delta_long?: number; // Optional: delta of long leg (used for debit spreads)
-
-  // EV inputs:
-  pop: number;
-  max_profit: number;
-  max_loss: number;
+  // Computed
+  credit: number;              // short_bid - long_ask
+  debit: number;               // long_bid - short_ask
+  mid_price: number;           // (credit + debit) / 2
+  max_profit: number;          // credit (for credit spreads)
+  max_loss: number;            // width - credit (for credit spreads)
 }
 
-export interface ScoringResult {
-  ivr_score: number;                // 0–1
-  vertical_skew_score: number;      // 0–1
-  term_structure_score: number;     // 0–1
-  delta_fitness_score: number;      // 0–1
-  ev_score: number;                 // 0–1
-
-  composite_score: number;          // 0–1
-
-  ev: number;                       // raw expected value
-  pop: number;                      // 0–1
+export interface CandidateScoring {
+  ivr_score: number;            // 0-1
+  vertical_skew_score: number;  // 0-1
+  term_structure_score: number; // 0-1
+  delta_fitness_score: number; // 0-1
+  ev_score: number;            // 0-1
+  composite_score: number;     // weighted average
 }
-
-// ============================================================================
-// Risk Management Interfaces
-// ============================================================================
-
-export type SystemMode = 'NORMAL' | 'HARD_STOP';
-
-export type RiskStateFlag =
-  | 'NORMAL'
-  | 'DAILY_STOP_HIT'
-  | 'PREMARKET_CHECK_FAILED'
-  | 'BROKER_RATE_LIMITED'
-  | 'EMERGENCY_EXIT_OCCURRED_TODAY';
-
-export interface RiskSnapshot {
-  system_mode: SystemMode;
-  risk_state: RiskStateFlag;
-  daily_realized_pnl: number;
-  emergency_exit_count_today: number;
-}
-
-// ============================================================================
-// Engine Interfaces
-// ============================================================================
 
 export interface ProposalCandidate {
   symbol: string;
@@ -321,32 +350,38 @@ export interface ProposalCandidate {
   short_strike: number;
   long_strike: number;
   width: number;
-  credit: number;
-  strategy: 'BULL_PUT_CREDIT' | 'BEAR_CALL_CREDIT' | 'BULL_CALL_DEBIT' | 'BEAR_PUT_DEBIT' | 'IRON_CONDOR';
-
+  quantity: number;
+  strategy: string;
+  credit_target: number;
   metrics: CandidateMetrics;
-  scoring: ScoringResult;
+  scoring: CandidateScoring;
 }
 
-export interface ProposalResult {
-  proposal: ProposalRow | null;  // persisted
-  candidate: ProposalCandidate | null;
+// ============================================================================
+// Risk & System State
+// ============================================================================
+
+export interface RiskSnapshot {
+  system_mode: 'NORMAL' | 'HARD_STOP' | 'COOLDOWN';
+  risk_state: string;
+  daily_realized_pnl: number;
+  emergency_exit_count_today: number;
 }
 
-export interface EntryAttemptResult {
-  trade: TradeRow | null;
-  reason?: string; // for logging if no trade
-}
+// ============================================================================
+// Monitoring & Exit Decision
+// ============================================================================
 
-export interface LiveLegQuotes {
-  short_bid: number;
-  short_ask: number;
-  long_bid: number;
-  long_ask: number;
-  delta_short: number;
-  iv_short: number;
-  iv_long: number;
-}
+export type ExitTriggerType =
+  | 'NONE'
+  | 'PROFIT_TARGET'
+  | 'STOP_LOSS'
+  | 'TIME_EXIT'
+  | 'IV_CRUSH_EXIT'
+  | 'TRAIL_PROFIT'
+  | 'LOW_VALUE_CLOSE'
+  | 'EMERGENCY'
+  | 'STRUCTURAL_BREAK';
 
 export interface MonitoringMetrics {
   current_mark: number;
@@ -354,34 +389,27 @@ export interface MonitoringMetrics {
   pnl_fraction: number;
   loss_fraction: number;
   dte: number;
-
   underlying_price: number;
   underlying_change_1m: number;
   underlying_change_15s: number;
-
   liquidity_ok: boolean;
   quote_integrity_ok: boolean;
 }
-
-export type ExitTriggerType =
-  | 'NONE'
-  | 'EMERGENCY'
-  | 'STOP_LOSS'
-  | 'PROFIT_TARGET'
-  | 'TRAIL_PROFIT'
-  | 'TIME_EXIT'
-  | 'IV_CRUSH_EXIT'
-  | 'LOW_VALUE_CLOSE';
 
 export interface MonitoringDecision {
   trigger: ExitTriggerType;
   metrics: MonitoringMetrics;
 }
 
-export interface ExitExecutionResult {
-  trade: TradeRow;
-  trigger: ExitTriggerType;
-  success: boolean;
-  reason?: string;
+export interface EntryAttemptResult {
+  trade: TradeRow | null;
+  reason: string;
 }
 
+export interface ExitExecutionResult {
+  success: boolean;
+  reason?: string;  // Optional - some exits may not have a specific reason
+  fillPrice?: number;
+  trade?: TradeRow;  // Optional - the updated trade after exit
+  trigger?: ExitTriggerType;  // Optional - the exit trigger that was used
+}

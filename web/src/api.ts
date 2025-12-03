@@ -196,10 +196,12 @@ export interface ProposalWithOrders {
     ev_score: number;
     min_score_required: number;
     min_credit_required: number;
+    proposalKind?: 'ENTRY' | 'EXIT';  // New field
   };
   trade: {
     id: string;
     status: string;
+    strategy: string | null;
     entry_price: number | null;
     exit_price: number | null;
     opened_at: string | null;
@@ -207,6 +209,14 @@ export interface ProposalWithOrders {
     broker_order_id_open: string | null;
     broker_order_id_close: string | null;
   } | null;
+  order: {
+    status: 'PENDING' | 'PLACED' | 'PARTIAL' | 'FILLED' | 'CANCELLED' | 'REJECTED';
+    side: 'ENTRY' | 'EXIT';
+    avgFillPrice?: number | null;
+    tradierOrderId?: string | null;
+    clientOrderId?: string | null;
+  } | null;
+  lifecycleStatus?: string;  // New field: human-readable lifecycle status
   outcome: 'PENDING' | 'FILLED' | 'REJECTED' | 'INVALIDATED' | 'NOT_ATTEMPTED';
   outcomeReason: string;
   rejectionReasons: string[];
@@ -353,5 +363,138 @@ export async function updateSystemSetting(
   }
 
   return res.json() as Promise<UpdateSettingResponse>;
+}
+
+export interface PortfolioPosition {
+  id: string;
+  symbol: string;
+  expiration: string;
+  option_type: 'call' | 'put';
+  strike: number;
+  side: 'long' | 'short';
+  quantity: number;
+  cost_basis_per_contract: number | null;
+  last_price: number | null;
+  bid: number | null;
+  ask: number | null;
+  updated_at: string;
+}
+
+export interface PortfolioPositionsResponse {
+  timestamp: string;
+  total: number;
+  positions: PortfolioPosition[];
+  bySymbol: Record<string, PortfolioPosition[]>;
+}
+
+export async function getPortfolioPositions(): Promise<PortfolioPositionsResponse> {
+  return fetchApi<PortfolioPositionsResponse>('/portfolio-positions');
+}
+
+// Daily Summary API
+
+export interface DailySummary {
+  date: string;
+  generated_at: string;
+  summary: {
+    trades: {
+      opened: number;
+      closed: number;
+      open: number;
+    };
+    proposals: {
+      total: number;
+      ready: number;
+      consumed: number;
+      invalidated: number;
+    };
+    positions: {
+      total: number;
+      open: number;
+    };
+    pnl: {
+      realized_today: number;
+    };
+    account: {
+      cash: number;
+      buying_power: number;
+      equity: number;
+    } | null;
+  };
+  details: {
+    trades_opened: Array<{
+      id: string;
+      symbol: string;
+      strategy: string;
+      entry_price: number | null;
+      opened_at: string | null;
+      quantity: number;
+    }>;
+    trades_closed: Array<{
+      id: string;
+      symbol: string;
+      strategy: string;
+      entry_price: number | null;
+      exit_price: number | null;
+      exit_reason: string | null;
+      realized_pnl: number | null;
+      closed_at: string | null;
+    }>;
+    open_trades: Array<{
+      id: string;
+      symbol: string;
+      strategy: string;
+      entry_price: number | null;
+      status: string;
+    }>;
+    proposals: Array<{
+      id: string;
+      symbol: string;
+      strategy: string;
+      score: number;
+      status: string;
+      created_at: string;
+    }>;
+    exit_reasons: Record<string, number>;
+    trades_by_strategy: Record<string, number>;
+  };
+}
+
+export interface DailySummaryListResponse {
+  summaries: Array<{
+    date: string;
+    generated_at: string;
+  }>;
+}
+
+export async function getDailySummary(date?: string): Promise<DailySummary> {
+  const endpoint = date 
+    ? `/v2/daily-summary?date=${date}` 
+    : '/v2/daily-summary';
+  return fetchApi<DailySummary>(endpoint);
+}
+
+export async function getDailySummaryList(limit = 30): Promise<DailySummaryListResponse> {
+  return fetchApi<DailySummaryListResponse>(`/v2/daily-summary?action=list&limit=${limit}`);
+}
+
+export async function generateDailySummary(date?: string): Promise<DailySummary> {
+  const endpoint = date 
+    ? `/v2/daily-summary?date=${date}` 
+    : '/v2/daily-summary';
+  
+  const res = await fetch(`${API_BASE_URL}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`API error: ${res.status} ${res.statusText} - ${errorText}`);
+  }
+
+  return res.json() as Promise<DailySummary>;
 }
 

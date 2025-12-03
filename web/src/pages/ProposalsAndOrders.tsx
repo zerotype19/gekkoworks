@@ -150,6 +150,9 @@ export default function ProposalsAndOrders() {
                   Symbol
                 </th>
                 <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  Type
+                </th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                   Strategy
                 </th>
                 <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -187,6 +190,15 @@ export default function ProposalsAndOrders() {
                       <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
                         {item.proposal.symbol}
                       </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm">
+                        <span className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${
+                          item.proposal.proposalKind === 'EXIT' 
+                            ? 'bg-purple-100 text-purple-800' 
+                            : 'bg-blue-100 text-blue-800'
+                        }`}>
+                          {item.proposal.proposalKind || 'ENTRY'}
+                        </span>
+                      </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                         {item.proposal.strategy}
                       </td>
@@ -205,16 +217,24 @@ export default function ProposalsAndOrders() {
                         </span>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm">
-                        {item.entryOrder ? (
+                        {item.order ? (
                           <div>
-                            {entryOrderOk ? (
-                              <span className="text-green-600">✓ OK</span>
-                            ) : (
-                              <span className="text-red-600">✗ Error</span>
+                            <div className={`font-medium ${
+                              item.order.status === 'FILLED' ? 'text-green-600' :
+                              item.order.status === 'CANCELLED' || item.order.status === 'REJECTED' ? 'text-red-600' :
+                              item.order.status === 'PARTIAL' ? 'text-yellow-600' :
+                              'text-blue-600'
+                            }`}>
+                              {item.order.status}
+                            </div>
+                            {item.lifecycleStatus && (
+                              <div className="text-xs text-gray-500 mt-1">
+                                {item.lifecycleStatus}
+                              </div>
                             )}
-                            {item.entryOrderStatus && (
+                            {item.order.avgFillPrice && (
                               <div className="text-xs text-gray-500">
-                                Status: {item.entryOrderStatus.status_code}
+                                ${item.order.avgFillPrice.toFixed(2)}
                               </div>
                             )}
                           </div>
@@ -233,12 +253,16 @@ export default function ProposalsAndOrders() {
                     </tr>
                     {isExpanded && (
                       <tr>
-                        <td colSpan={9} className="px-6 py-4 bg-gray-50">
+                        <td colSpan={10} className="px-6 py-4 bg-gray-50">
                           <div className="space-y-4">
                             {/* Proposal Details */}
                             <div>
                               <h3 className="text-lg font-semibold text-gray-900 mb-2">Proposal Details</h3>
-                              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm mb-4">
+                                <div>
+                                  <span className="text-gray-500">Proposal ID:</span>
+                                  <div className="text-gray-900 font-mono text-xs break-all">{item.proposal.id}</div>
+                                </div>
                                 <div>
                                   <span className="text-gray-500">Expiration:</span>
                                   <div className="text-gray-900 font-medium">{item.proposal.expiration}</div>
@@ -321,7 +345,13 @@ export default function ProposalsAndOrders() {
                                   </div>
                                   <div>
                                     <span className="text-gray-500">Status:</span>
-                                    <div className="text-gray-900 font-medium">{item.trade.status}</div>
+                                    <div className={`font-medium ${
+                                      item.trade.status === 'OPEN' ? 'text-green-600' :
+                                      item.trade.status === 'CLOSED' ? 'text-gray-600' :
+                                      'text-yellow-600'
+                                    }`}>
+                                      {item.trade.status}
+                                    </div>
                                   </div>
                                   <div>
                                     <span className="text-gray-500">Entry Price:</span>
@@ -336,6 +366,48 @@ export default function ProposalsAndOrders() {
                                     </div>
                                   </div>
                                 </div>
+                                <div className="mt-2 text-xs text-gray-500">
+                                  <div>Strategy: {item.trade.strategy || 'N/A'}</div>
+                                </div>
+                              </div>
+                            )}
+                            
+                            {/* Order Info (from orders table) */}
+                            {item.order && (
+                              <div>
+                                <h3 className="text-lg font-semibold text-gray-900 mb-2">Order</h3>
+                                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                                  <div>
+                                    <span className="text-gray-500">Side:</span>
+                                    <div className="text-gray-900 font-medium">{item.order.side}</div>
+                                  </div>
+                                  <div>
+                                    <span className="text-gray-500">Status:</span>
+                                    <div className={`font-medium ${
+                                      item.order.status === 'FILLED' ? 'text-green-600' :
+                                      item.order.status === 'CANCELLED' || item.order.status === 'REJECTED' ? 'text-red-600' :
+                                      item.order.status === 'PARTIAL' ? 'text-yellow-600' :
+                                      'text-blue-600'
+                                    }`}>
+                                      {item.order.status}
+                                    </div>
+                                  </div>
+                                  <div>
+                                    <span className="text-gray-500">Fill Price:</span>
+                                    <div className="text-gray-900 font-medium">
+                                      {item.order.avgFillPrice ? `$${item.order.avgFillPrice.toFixed(2)}` : 'N/A'}
+                                    </div>
+                                  </div>
+                                  <div>
+                                    <span className="text-gray-500">Tradier Order ID:</span>
+                                    <div className="text-gray-900 font-mono text-xs">{item.order.tradierOrderId || 'N/A'}</div>
+                                  </div>
+                                </div>
+                                {item.lifecycleStatus && (
+                                  <div className="mt-2 text-sm text-gray-600">
+                                    <strong>Lifecycle:</strong> {item.lifecycleStatus}
+                                  </div>
+                                )}
                               </div>
                             )}
 

@@ -8,6 +8,15 @@
  * - Compute PnL and metrics
  * - Detect instability
  * - Determine exit triggers in priority order
+ * 
+ * PORTFOLIO-FIRST APPROACH:
+ * - Entry prices: Always from trade.entry_price (stored at trade open)
+ * - Quantities: From portfolio_positions (via getSpreadLegPositions)
+ * - Current pricing: From portfolio_positions bid/ask (updated during portfolio sync)
+ * - PnL calculation: entry_price (from trade) vs current_mark (from portfolio_positions bid/ask)
+ * 
+ * This dramatically reduces API calls - bid/ask is fetched once during portfolio sync
+ * instead of fetching option chains for every trade during every monitoring cycle.
  */
 
 import type { Env } from '../env';
@@ -21,9 +30,10 @@ import type {
 } from '../types';
 import { TradierClient } from '../broker/tradierClient';
 import { computeDTE } from '../core/time';
-import { getSetting, setSetting, updateTrade, getOpenTrades } from '../db/queries';
+import { getSetting, setSetting, updateTrade, getOpenTrades, getSpreadLegPositions } from '../db/queries';
 import { getExitRuleThresholds, getDefaultTradeQuantity } from '../core/config';
 import { toET } from '../core/time';
+import { computeSpreadPositionSnapshot } from '../core/positions';
 
 /**
  * Evaluate an open trade and determine exit action
@@ -48,7 +58,7 @@ export async function evaluateOpenTrade(
   try {
     // Note: We catch errors at the end to handle transient broker errors gracefully
     // Only structural/data corruption issues should trigger EMERGENCY exits
-    // [data][tradier][quotes] Fetch live underlying quote
+    // [data][tradier][quotes] Fetch live underlying quote (still needed for underlying price)
     const quoteStartTime = Date.now();
     const underlying = await broker.getUnderlyingQuote(trade.symbol);
     const quoteDurationMs = Date.now() - quoteStartTime;
@@ -60,20 +70,37 @@ export async function evaluateOpenTrade(
       timestamp: now.toISOString(),
     }));
     
-    // [data][tradier][chains] Fetch live option chain
+    // [data][portfolio] Get bid/ask from portfolio_positions (updated during portfolio sync)
+    // This is much more efficient than fetching option chains for every trade
+    const optionType = (trade.strategy === 'BEAR_CALL_CREDIT' || trade.strategy === 'BULL_CALL_DEBIT') ? 'call' : 'put';
+    const { shortLeg, longLeg } = await getSpreadLegPositions(
+      env,
+      trade.symbol,
+      trade.expiration,
+      optionType,
+      trade.short_strike,
+      trade.long_strike
+    );
+    const snapshot = computeSpreadPositionSnapshot(trade, shortLeg, longLeg);
+    
+    console.log('[data][portfolio][quotes]', JSON.stringify({
+      trade_id: trade.id,
+      symbol: trade.symbol,
+      expiration: trade.expiration,
+      short_bid: snapshot.shortBid,
+      short_ask: snapshot.shortAsk,
+      long_bid: snapshot.longBid,
+      long_ask: snapshot.longAsk,
+      timestamp: now.toISOString(),
+    }));
+    
+    // [STRUCTURAL_INTEGRITY] Check spread structure using portfolio_positions
+    // For structural integrity, we still need option chain to verify strikes exist
+    // But we use portfolio_positions for bid/ask (the expensive part)
     const chainStartTime = Date.now();
     const optionChain = await broker.getOptionChain(trade.symbol, trade.expiration);
     const chainDurationMs = Date.now() - chainStartTime;
     
-    console.log('[data][tradier][chains]', JSON.stringify({
-      symbol: trade.symbol,
-      expiration: trade.expiration,
-      count: optionChain.length,
-      duration_ms: chainDurationMs,
-      timestamp: now.toISOString(),
-    }));
-    
-    // [STRUCTURAL_INTEGRITY] Check spread structure FIRST (works without entry_price)
     const integrityCheck = await checkStructuralIntegrity(env, trade, broker, optionChain);
     if (!integrityCheck.valid) {
       // Compute DTE for the error response
@@ -130,6 +157,9 @@ export async function evaluateOpenTrade(
       const dteForTimeExit = computeDTE(trade.expiration, now);
       
       // Create minimal metrics for time-based exit evaluation
+      // CRITICAL: Set liquidity_ok and quote_integrity_ok to true to prevent EMERGENCY trigger
+      // We're only checking time-based exits here, not P&L-based exits, so we don't need quotes
+      // Setting these to false would cause shouldTriggerEmergency to return true immediately
       const minimalMetrics: MonitoringMetrics = {
         current_mark: 0,
         unrealized_pnl: 0,
@@ -139,13 +169,14 @@ export async function evaluateOpenTrade(
         underlying_price: underlying.last,
         underlying_change_1m: 0,
         underlying_change_15s: 0,
-        liquidity_ok: false,
-        quote_integrity_ok: false,
+        liquidity_ok: true, // Set to true to prevent EMERGENCY trigger when only checking time exits
+        quote_integrity_ok: true, // Set to true to prevent EMERGENCY trigger when only checking time exits
       };
       
       // Check time-based exits even without entry_price
       // Pass minimal metrics - evaluateCloseRules will skip P&L-based rules but check TIME_EXIT
       // Pass optionChain to avoid refetching if needed
+      // NOTE: evaluateCloseRules will skip shouldTriggerEmergency checks since liquidity_ok and quote_integrity_ok are true
       const timeBasedDecision = await evaluateCloseRules(env, trade, minimalMetrics, now, optionChain);
       
       // If time-based exit triggered, return it; otherwise return NONE
@@ -159,56 +190,75 @@ export async function evaluateOpenTrade(
       };
     }
     
-    // Determine option type based on strategy
-    const optionType = (trade.strategy === 'BEAR_CALL_CREDIT' || trade.strategy === 'BULL_CALL_DEBIT') ? 'call' : 'put';
-    const isDebitSpread = trade.strategy === 'BULL_CALL_DEBIT' || trade.strategy === 'BEAR_PUT_DEBIT';
-    
-    // Find option quotes for our legs
-    const shortOption = optionChain.find(
-      opt => opt.strike === trade.short_strike && opt.type === optionType
-    );
-    const longOption = optionChain.find(
-      opt => opt.strike === trade.long_strike && opt.type === optionType
-    );
-    
-    // Check data integrity - Emergency if missing
-    if (!shortOption || !longOption) {
-      console.error('[data][missing-field]', JSON.stringify({
-        trade_id: trade.id,
-        symbol: trade.symbol,
-        strategy: trade.strategy,
-        option_type: optionType,
-        missing_legs: {
-          short: !shortOption,
-          long: !longOption,
-        },
-      }));
-      return {
-        trigger: 'EMERGENCY',
-        metrics: createEmergencyMetrics(trade, now),
-      };
-    }
-    
-    if (!shortOption.bid || !shortOption.ask || !longOption.bid || !longOption.ask) {
-      console.error('[data][missing-field]', JSON.stringify({
+    // Check data integrity - Use bid/ask from portfolio_positions
+    // If bid/ask is missing from portfolio, it means portfolio sync hasn't fetched it yet
+    // or the position doesn't exist (which would be caught by structural integrity check)
+    if (!snapshot.shortBid || !snapshot.shortAsk || !snapshot.longBid || !snapshot.longAsk) {
+      console.warn('[data][missing-quotes]', JSON.stringify({
         trade_id: trade.id,
         symbol: trade.symbol,
         strategy: trade.strategy,
         option_type: optionType,
         missing_quotes: {
-          short_bid: !shortOption.bid,
-          short_ask: !shortOption.ask,
-          long_bid: !longOption.bid,
-          long_ask: !longOption.ask,
+          short_bid: !snapshot.shortBid,
+          short_ask: !snapshot.shortAsk,
+          long_bid: !snapshot.longBid,
+          long_ask: !snapshot.longAsk,
         },
+        note: 'Missing bid/ask from portfolio_positions - portfolio sync may not have fetched quotes yet. Skipping this cycle.',
       }));
+      // Return NONE to skip this cycle rather than triggering EMERGENCY
+      // Portfolio sync will fetch quotes on next run
       return {
-        trigger: 'EMERGENCY',
-        metrics: createEmergencyMetrics(trade, now),
+        trigger: 'NONE',
+        metrics: {
+          current_mark: 0,
+          unrealized_pnl: 0,
+          pnl_fraction: 0,
+          loss_fraction: 0,
+          dte: computeDTE(trade.expiration, now),
+          underlying_price: underlying.last,
+          underlying_change_1m: 0,
+          underlying_change_15s: 0,
+          liquidity_ok: false,
+          quote_integrity_ok: false,
+        },
       };
     }
     
-    // Compute metrics (uses fresh quotes from Tradier - no stale data)
+    // Create OptionQuote objects from portfolio_positions bid/ask
+    // This allows us to reuse computeMonitoringMetrics without major refactoring
+    // We construct minimal OptionQuote objects with required fields
+    const shortOption: OptionQuote = {
+      symbol: `${trade.symbol}${trade.expiration.replace(/-/g, '')}${optionType === 'put' ? 'P' : 'C'}${String(trade.short_strike * 1000).padStart(8, '0')}`,
+      underlying: trade.symbol,
+      type: optionType,
+      expiration_date: trade.expiration,
+      strike: trade.short_strike,
+      bid: snapshot.shortBid!,
+      ask: snapshot.shortAsk!,
+      last: snapshot.shortBid! + (snapshot.shortAsk! - snapshot.shortBid!) / 2, // Midpoint as last
+      delta: null, // Not needed for PnL calculation
+      implied_volatility: null, // Not needed for PnL calculation (IV crush uses optionChain)
+    };
+    const longOption: OptionQuote = {
+      symbol: `${trade.symbol}${trade.expiration.replace(/-/g, '')}${optionType === 'put' ? 'P' : 'C'}${String(trade.long_strike * 1000).padStart(8, '0')}`,
+      underlying: trade.symbol,
+      type: optionType,
+      expiration_date: trade.expiration,
+      strike: trade.long_strike,
+      bid: snapshot.longBid!,
+      ask: snapshot.longAsk!,
+      last: snapshot.longBid! + (snapshot.longAsk! - snapshot.longBid!) / 2, // Midpoint as last
+      delta: null, // Not needed for PnL calculation
+      implied_volatility: null, // Not needed for PnL calculation (IV crush uses optionChain)
+    };
+    
+    // Compute metrics using bid/ask from portfolio_positions
+    // CRITICAL: PnL calculation uses:
+    // - entry_price: From trade.entry_price (stored at trade open)
+    // - current_mark: From portfolio_positions bid/ask (updated during portfolio sync)
+    // - Quantities: Not used here (exits.ts uses portfolio_positions for exit sizing)
     const metrics = await computeMonitoringMetrics(
       env,
       trade,
@@ -242,10 +292,10 @@ export async function evaluateOpenTrade(
     
     // Note: max_seen_profit_fraction is updated in evaluateCloseRules to avoid double-updating
     // Log exit evaluation with full context
-    // Get current IV for logging
+    // Get current IV for logging - reuse optionChain already fetched above
     let iv_now: number | null = null;
     try {
-      const optionChain = await broker.getOptionChain(trade.symbol, trade.expiration);
+      // Reuse optionChain already fetched above - no need to refetch
       // Determine option type based on strategy
       const optionType = (trade.strategy === 'BEAR_CALL_CREDIT' || trade.strategy === 'BULL_CALL_DEBIT') ? 'call' : 'put';
       const shortOption = optionChain.find(
@@ -364,7 +414,12 @@ async function computeMonitoringMetrics(
     throw new Error('Trade has no entry_price');
   }
   
+  // PORTFOLIO-FIRST: Entry price comes from trade.entry_price (stored at trade open)
+  // This is the source of truth for entry pricing - never recalculate from orders
+  
   // Mark price calculation depends on strategy type
+  // Current pricing comes from Tradier option chain (fresh bid/ask quotes)
+  // NOTE: portfolio_positions doesn't store bid/ask, so we fetch from Tradier
   const markShort = (shortOption.bid + shortOption.ask) / 2;
   const markLong = (longOption.bid + longOption.ask) / 2;
   
@@ -373,7 +428,8 @@ async function computeMonitoringMetrics(
   const isDebitSpread = trade.strategy === 'BULL_CALL_DEBIT' || trade.strategy === 'BEAR_PUT_DEBIT';
   const currentMark = isDebitSpread ? markLong - markShort : markShort - markLong;
   
-  // PnL calculation
+  // PnL calculation: entry_price (from trade) vs current_mark (from Tradier quotes)
+  // This is per-contract PnL - exits.ts multiplies by quantity from portfolio_positions
   let unrealized_pnl: number;
   let max_profit: number;
   let max_loss: number;
@@ -472,6 +528,9 @@ async function evaluateCloseRules(
 
   // 0) Emergency conditions (quote/liquidity/volatility shock)
   // Note: Structural break is checked in evaluateOpenTrade before this function
+  // NOTE: evaluateOpenTrade already returns early if quote_integrity_ok or liquidity_ok are false,
+  // so the first two branches of shouldTriggerEmergency are effectively unreachable in normal flow.
+  // However, we keep them here for defensive programming and to handle edge cases.
   if (await shouldTriggerEmergency(env, metrics, LIQUIDITY_SPREAD_THRESHOLD, UNDERLYING_SPIKE_THRESHOLD)) {
     console.log('[monitor][exit][triggered]', JSON.stringify({
       trade_id: trade.id,
@@ -489,8 +548,8 @@ async function evaluateCloseRules(
   const newPeak = Math.max(currentPeak, currentProfitFraction);
   
   // Update trade's max_seen_profit_fraction if it increased
+  // NOTE: updateTrade is already imported at the top of the file, no need for dynamic import
   if (newPeak > currentPeak) {
-    const { updateTrade } = await import('../db/queries');
     await updateTrade(env, trade.id, { max_seen_profit_fraction: newPeak });
     console.log('[monitor][exit][trail][armed]', JSON.stringify({
       trade_id: trade.id,
@@ -684,9 +743,11 @@ async function evaluateCloseRules(
     }
   }
 
-  // 6) STRUCTURE_INVALID – negative or nonsensical pricing
+  // 6) MARK_SANITY_CHECK – negative or nonsensical pricing
+  // NOTE: This is a mark sanity check, not a structural invariant check.
+  // Structural invariants (strikes, legs, positions) are checked in checkStructuralIntegrity.
   if (metrics.current_mark <= 0) {
-    console.log('[close] STRUCTURE_INVALID triggered', {
+    console.log('[close] MARK_SANITY_CHECK triggered', {
       trade_id: trade.id,
       current_mark: metrics.current_mark,
     });
@@ -926,10 +987,13 @@ export async function repairPortfolio(env: Env, now: Date): Promise<void> {
  * Check structural integrity of a spread trade
  * 
  * Verifies:
- * 1. Strikes match pattern: long_strike === short_strike - 5
+ * 1. Strikes match pattern based on strategy (width-based)
  * 2. Both legs exist in option chain
  * 3. Both legs exist in broker positions (Tradier)
- * 4. Quantities match (always 1 in v1)
+ * 4. Quantities match (Tradier quantity >= trade quantity, with warning if Tradier > trade)
+ * 
+ * NOTE: Quantities are checked at open time. Later, trades may have partial exits or scaling,
+ * so quantity mismatches are only trusted at validation time, not during monitoring.
  * 
  * Returns { valid: false, reason, details } if structural break detected.
  */
@@ -1039,21 +1103,27 @@ async function checkStructuralIntegrity(
     try {
       // First, verify the entry order actually filled
       // If the order was never filled, the trade shouldn't be OPEN
+      // NOTE: This is a data repair issue, not a structural break that requires EMERGENCY exit
+      // If the order never filled, there's likely no position to close, so we should mark as CANCELLED
+      // rather than triggering EMERGENCY exit (which would try to close a non-existent position)
       if (trade.broker_order_id_open) {
         try {
           const entryOrder = await broker.getOrder(trade.broker_order_id_open);
           if (entryOrder.status !== 'FILLED') {
             // Order was never filled - this is a data integrity issue
-            // Don't trigger emergency exit, but log the issue
+            // Log the issue but don't mark as invalid structure (that would trigger EMERGENCY)
+            // Instead, return valid: true with a note - repairPortfolio should handle this separately
             console.error('[monitor] entry_order_not_filled', JSON.stringify({
               trade_id: trade.id,
               order_id: trade.broker_order_id_open,
               order_status: entryOrder.status,
-              note: 'Trade marked OPEN but entry order was never filled',
+              note: 'Trade marked OPEN but entry order was never filled - repairPortfolio should mark as CANCELLED, not trigger EMERGENCY exit',
             }));
+            // Return valid: true to avoid triggering EMERGENCY exit
+            // repairPortfolio should handle this by marking trade as CANCELLED
             return {
-              valid: false,
-              reason: 'ENTRY_ORDER_NOT_FILLED',
+              valid: true, // Don't trigger EMERGENCY - repairPortfolio will handle this
+              reason: 'ENTRY_ORDER_NOT_FILLED', // Logged for repairPortfolio to handle
               details: {
                 order_id: trade.broker_order_id_open,
                 order_status: entryOrder.status,
@@ -1080,10 +1150,12 @@ async function checkStructuralIntegrity(
         pos => pos.symbol === longOption.symbol
       );
       
-      // Check if trade was recently opened (within last 2 minutes)
+      // Check if trade was recently opened (within last 15 minutes)
       // Positions might not be synced yet, so we'll be lenient
+      // FIXED: Increased from 2 to 15 minutes to prevent false EMERGENCY exits
+      // Portfolio sync runs periodically, so we need more time for positions to appear
       const openedAt = trade.opened_at ? new Date(trade.opened_at) : null;
-      const recentlyOpened = openedAt && (Date.now() - openedAt.getTime()) < 2 * 60 * 1000; // 2 minutes
+      const recentlyOpened = openedAt && (Date.now() - openedAt.getTime()) < 15 * 60 * 1000; // 15 minutes
       
       if (!shortPosition) {
         // If recently opened, log warning but don't fail validation

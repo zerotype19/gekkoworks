@@ -154,6 +154,22 @@ export function toET(date: Date): Date {
 }
 
 /**
+ * Parse a date string (YYYY-MM-DD) and return it as a Date object representing that date in ET timezone
+ * This ensures dates passed as strings are interpreted as ET dates, not UTC
+ * Creates the date at noon ET to avoid timezone boundary issues
+ */
+export function parseETDateString(dateStr: string): Date {
+  // Parse as YYYY-MM-DD and create date at noon ET to avoid timezone shifts
+  const [year, month, day] = dateStr.split('-').map(Number);
+  // Create date at noon ET by creating it at UTC midnight of the date, then converting to ET
+  // Since we want noon ET, we create it at 17:00 UTC (which is noon EST) or 16:00 UTC (noon EDT)
+  // Use EST (UTC-5) as worst case to avoid boundary issues
+  const offsetHours = 5; // EST offset (worst case, DST would be 4)
+  const utcDate = new Date(Date.UTC(year, month - 1, day, 12 + offsetHours, 0, 0));
+  return utcDate;
+}
+
+/**
  * Get the current date in ET timezone as YYYY-MM-DD string
  */
 export function getETDateString(date: Date): string {
@@ -200,4 +216,3 @@ export function isPostMarket(now: Date): boolean {
   
   return timeInMinutes >= marketClose;
 }
-

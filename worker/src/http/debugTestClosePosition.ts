@@ -86,17 +86,23 @@ export async function handleDebugTestClosePosition(
       const underlying = await broker.getUnderlyingQuote(openTrade.symbol);
       const optionChain = await broker.getOptionChain(openTrade.symbol, openTrade.expiration);
       
-      const shortPut = optionChain.find(
-        opt => opt.strike === openTrade.short_strike && opt.type === 'put'
+      // Determine option type from strategy
+      if (!openTrade.strategy) {
+        throw new Error('Trade missing strategy field - cannot determine option type');
+      }
+      const optionType = (openTrade.strategy === 'BEAR_CALL_CREDIT' || openTrade.strategy === 'BULL_CALL_DEBIT') ? 'call' : 'put';
+      
+      const shortOption = optionChain.find(
+        opt => opt.strike === openTrade.short_strike && opt.type === optionType
       );
-      const longPut = optionChain.find(
-        opt => opt.strike === openTrade.long_strike && opt.type === 'put'
+      const longOption = optionChain.find(
+        opt => opt.strike === openTrade.long_strike && opt.type === optionType
       );
       
-      if (shortPut && longPut && shortPut.bid && shortPut.ask && longPut.bid && longPut.ask) {
+      if (shortOption && longOption && shortOption.bid && shortOption.ask && longOption.bid && longOption.ask) {
         // Use real quotes
-        const markShort = (shortPut.bid + shortPut.ask) / 2;
-        const markLong = (longPut.bid + longPut.ask) / 2;
+        const markShort = (shortOption.bid + shortOption.ask) / 2;
+        const markLong = (longOption.bid + longOption.ask) / 2;
         const currentMark = markShort - markLong;
         
         exitDecision = {

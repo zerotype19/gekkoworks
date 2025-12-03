@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS trades (
   updated_at TEXT NOT NULL,
   realized_pnl REAL,
   max_seen_profit_fraction REAL,
-  iv_entry REAL
+  iv_entry REAL,
+  strategy TEXT DEFAULT 'BULL_PUT_CREDIT',
+  origin TEXT DEFAULT 'ENGINE',
+  managed INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS proposals (
@@ -44,7 +47,10 @@ CREATE TABLE IF NOT EXISTS proposals (
   delta_fitness_score REAL NOT NULL,
   ev_score REAL NOT NULL,
   created_at TEXT NOT NULL,
-  status TEXT NOT NULL
+  status TEXT NOT NULL,
+  kind TEXT,
+  linked_trade_id TEXT,
+  client_order_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_proposals_strategy ON proposals(strategy);
@@ -92,6 +98,32 @@ CREATE INDEX IF NOT EXISTS idx_system_logs_created_at
   ON system_logs (created_at DESC);
 
 -- ============================================================================
+-- Portfolio Positions
+-- 
+-- Pure mirror of Tradier positions (one row per leg, not per spread).
+-- This is the source of truth for actual broker positions.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS portfolio_positions (
+  id TEXT PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  expiration TEXT NOT NULL,             -- 'YYYY-MM-DD'
+  option_type TEXT NOT NULL,            -- 'call' or 'put'
+  strike REAL NOT NULL,
+  side TEXT NOT NULL,                   -- 'long' or 'short'
+  quantity INTEGER NOT NULL,
+  cost_basis_per_contract REAL,         -- nullable; per-contract basis
+  last_price REAL,                      -- nullable; last/mark price
+  bid REAL,                             -- nullable; current bid price (from option chain)
+  ask REAL,                             -- nullable; current ask price (from option chain)
+  snapshot_id TEXT,                     -- nullable; links to tradier_snapshots.id
+  updated_at TEXT NOT NULL              -- ISO timestamp
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_portfolio_positions_key
+  ON portfolio_positions (symbol, expiration, option_type, strike, side);
+
+-- ============================================================================
 -- Account Snapshots
 -- 
 -- Per monitoring.md / architecture.md:
@@ -118,5 +150,44 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
   source TEXT NOT NULL DEFAULT 'TRADIER',  -- or 'INTERNAL'
   UNIQUE(account_id, mode, captured_at)
 );
+
+-- ============================================================================
+-- Tradier Sync Snapshots
+-- 
+-- Tracks master sync operations to ensure all positions/orders/balances
+-- are synced together in a coherent snapshot.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS tradier_snapshots (
+  id TEXT PRIMARY KEY,                    -- snapshotId (UUID)
+  account_id TEXT NOT NULL,
+  as_of TEXT NOT NULL,                   -- ISO timestamp when snapshot was taken
+  positions_count INTEGER DEFAULT 0,
+  orders_count INTEGER DEFAULT 0,
+  balances_cash REAL,
+  balances_buying_power REAL,
+  balances_equity REAL,
+  balances_margin_requirement REAL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tradier_snapshots_as_of ON tradier_snapshots(as_of DESC);
+CREATE INDEX IF NOT EXISTS idx_tradier_snapshots_account_id ON tradier_snapshots(account_id);
+
+CREATE TABLE IF NOT EXISTS account_balances (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  cash REAL NOT NULL,
+  buying_power REAL NOT NULL,
+  equity REAL NOT NULL,
+  margin_requirement REAL NOT NULL,
+  as_of TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (snapshot_id) REFERENCES tradier_snapshots(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_balances_snapshot_id ON account_balances(snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_account_balances_as_of ON account_balances(as_of DESC);
 
 

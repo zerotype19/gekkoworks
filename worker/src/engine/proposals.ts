@@ -34,12 +34,11 @@ import {
 import {
   computeIVR,
   computeVerticalSkew,
-  computeTermStructure,
   computePOP,
   computeEV,
   isRVIVRatioValid,
 } from '../core/metrics';
-import { scoreCandidate, meetsScoreThreshold } from '../core/scoring';
+import { scoreCandidate } from '../core/scoring';
 import { insertProposal, insertSystemLog } from '../db/queries';
 import { getTradingMode, getStrategyThresholds, getDefaultTradeQuantity, type TradingMode } from '../core/config';
 import { getOpenTrades } from '../db/queries';
@@ -214,14 +213,48 @@ export async function generateProposal(
     const rv_30d = 0.15; // Placeholder - needs actual data
     const iv_30d = 0.20; // Placeholder - needs actual data
     
-    if (!isRVIVRatioValid(rv_30d, iv_30d)) {
+    // CRITICAL: Log RV/IV ratio check to avoid silent short-circuiting
+    const rvIvRatio = rv_30d / iv_30d;
+    const rvIvValid = isRVIVRatioValid(rv_30d, iv_30d);
+    console.log('[proposals][rv_iv_gate]', JSON.stringify({
+      rv_30d,
+      iv_30d,
+      ratio: rvIvRatio,
+      valid: rvIvValid,
+      mode,
+      note: 'Using placeholder RV/IV values - consider relaxing in SANDBOX until real data is wired',
+    }));
+    
+    // In SANDBOX mode, relax the RV/IV gate to allow testing even with placeholder values
+    // In LIVE/DRY_RUN, enforce the gate strictly
+    if (!rvIvValid && mode !== 'SANDBOX_PAPER') {
+      console.log('[proposals][rv_iv_gate][rejected]', JSON.stringify({
+        rv_30d,
+        iv_30d,
+        ratio: rvIvRatio,
+        mode,
+        reason: 'RV/IV ratio invalid - entire proposal generation short-circuited',
+      }));
       return { proposal: null, candidate: null };
+    } else if (!rvIvValid && mode === 'SANDBOX_PAPER') {
+      console.log('[proposals][rv_iv_gate][relaxed]', JSON.stringify({
+        rv_30d,
+        iv_30d,
+        ratio: rvIvRatio,
+        mode,
+        note: 'RV/IV ratio invalid but SANDBOX mode - allowing proposal generation to continue',
+      }));
     }
     
     // Collect all candidates across all symbols and strategies
     const allCandidates: RawCandidate[] = [];
     const symbolSummaries: Array<{ symbol: string; candidateCount: number }> = [];
     const allExpirations: Array<{ expiration: string; dte: number }> = [];
+    
+    // CRITICAL: Pre-compute trend checks per symbol to avoid duplicate API calls
+    // This cache will be reused in scoring phase for debit spreads
+    const { checkBullishTrend, checkBearishTrend } = await import('../core/trend');
+    const trendCache = new Map<string, { bullish?: Awaited<ReturnType<typeof checkBullishTrend>>; bearish?: Awaited<ReturnType<typeof checkBearishTrend>> }>();
     
     // Loop through each symbol
     for (const symbol of symbols) {
@@ -259,7 +292,8 @@ export async function generateProposal(
         }
         
         // Cache trend checks per symbol (used for debit spreads)
-        const { checkBullishTrend, checkBearishTrend } = await import('../core/trend');
+        // CRITICAL: Pre-compute trend checks once per symbol to avoid duplicate API calls
+        // These will be reused in scoring phase for debit spreads
         let cachedBullishTrend: Awaited<ReturnType<typeof checkBullishTrend>> | null = null;
         let cachedBearishTrend: Awaited<ReturnType<typeof checkBearishTrend>> | null = null;
         
@@ -315,14 +349,16 @@ export async function generateProposal(
                   // shortTermBias: 1.0 if price << SMA (bearish), 0.0 if price >> SMA (bullish)
                   shortTermBias = Math.max(0, Math.min(1, 0.5 - (priceVsSMA / 0.04)));
                 }
-                // Allow if shortTermBias <= 0.50 (neutral-to-weakening trends)
-                // Note: 0.5 = neutral, so we allow neutral and weakening (0.4-0.5) trends
-                if (shortTermBias > 0.50) {
+                // CRITICAL FIX: Bear call credit spreads benefit from bearish/neutral trends, not bullish
+                // We want to avoid very bullish environments (shortTermBias << 0.5) where calls are expensive
+                // Allow if shortTermBias >= 0.40 (neutral-to-bearish trends are favorable)
+                // Reject if shortTermBias < 0.40 (too bullish - calls are expensive, not good for bear call credit)
+                if (shortTermBias < 0.40) {
                   console.log('[strategy][bear_call_credit][bias_reject]', JSON.stringify({
                     symbol,
                     expiration,
                     shortTermBias,
-                    reason: `Short-term bias ${shortTermBias.toFixed(3)} > 0.50 (too bearish)`,
+                    reason: `Short-term bias ${shortTermBias.toFixed(3)} < 0.40 (too bullish - calls are expensive, not favorable for bear call credit)`,
                   }));
                   continue;
                 }
@@ -360,6 +396,11 @@ export async function generateProposal(
                 // Use cached trend check to avoid repeated API calls
                 if (!cachedBullishTrend) {
                   cachedBullishTrend = await checkBullishTrend(env, symbol, underlyingQuote.last);
+                  // Store in cache for reuse in scoring phase
+                  if (!trendCache.has(symbol)) {
+                    trendCache.set(symbol, {});
+                  }
+                  trendCache.get(symbol)!.bullish = cachedBullishTrend;
                 }
                 const trendCheck = cachedBullishTrend;
                 // Allow if trendScore >= 0.35 (neutral-to-mild bullish)
@@ -407,6 +448,11 @@ export async function generateProposal(
                 // Use cached trend check to avoid repeated API calls
                 if (!cachedBearishTrend) {
                   cachedBearishTrend = await checkBearishTrend(env, symbol, underlyingQuote.last);
+                  // Store in cache for reuse in scoring phase
+                  if (!trendCache.has(symbol)) {
+                    trendCache.set(symbol, {});
+                  }
+                  trendCache.get(symbol)!.bearish = cachedBearishTrend;
                 }
                 const trendCheck = cachedBearishTrend;
                 // Allow if trendScore >= 0.35 (neutral-to-mild bearish)
@@ -579,21 +625,37 @@ export async function generateProposal(
           // Use different scoring for debit spreads
           if (candidate.strategy === 'BULL_CALL_DEBIT' || candidate.strategy === 'BEAR_PUT_DEBIT') {
             const { scoreDebitCandidate } = await import('../core/scoring');
-            const { checkBullishTrend, checkBearishTrend } = await import('../core/trend');
             
-            // Fetch underlying quote for trend check
-            // OPTIMIZATION NOTE: This duplicates trend checks done during candidate building.
-            // Consider caching trend checks per symbol in a Map and reusing them here to avoid repeated API calls.
-            const underlyingQuoteForTrend = await broker.getUnderlyingQuote(candidate.symbol);
-            let trendCheck;
-            if (candidate.strategy === 'BULL_CALL_DEBIT') {
-              trendCheck = await checkBullishTrend(env, candidate.symbol, underlyingQuoteForTrend.last);
+            // OPTIMIZATION: Reuse cached trend checks from candidate building phase
+            // This avoids duplicate broker.getUnderlyingQuote + trend API calls
+            let trendScore: number;
+            const cachedTrend = trendCache.get(candidate.symbol);
+            if (candidate.strategy === 'BULL_CALL_DEBIT' && cachedTrend?.bullish) {
+              trendScore = cachedTrend.bullish.trendScore;
+            } else if (candidate.strategy === 'BEAR_PUT_DEBIT' && cachedTrend?.bearish) {
+              trendScore = cachedTrend.bearish.trendScore;
             } else {
-              trendCheck = await checkBearishTrend(env, candidate.symbol, underlyingQuoteForTrend.last);
+              // Fallback: if cache miss (shouldn't happen), fetch fresh
+              const { checkBullishTrend, checkBearishTrend } = await import('../core/trend');
+              const underlyingQuoteForTrend = await broker.getUnderlyingQuote(candidate.symbol);
+              const trendCheck = candidate.strategy === 'BULL_CALL_DEBIT'
+                ? await checkBullishTrend(env, candidate.symbol, underlyingQuoteForTrend.last)
+                : await checkBearishTrend(env, candidate.symbol, underlyingQuoteForTrend.last);
+              trendScore = trendCheck.trendScore;
+              // Cache for future use
+              if (!trendCache.has(candidate.symbol)) {
+                trendCache.set(candidate.symbol, {});
+              }
+              if (candidate.strategy === 'BULL_CALL_DEBIT') {
+                trendCache.get(candidate.symbol)!.bullish = trendCheck;
+              } else {
+                trendCache.get(candidate.symbol)!.bearish = trendCheck;
+              }
             }
-            const trendScore = trendCheck.trendScore; // Use actual trendScore, not valid/invalid
             
             // Compute metrics for debit spread
+            // NOTE: metrics.credit will be negative for debit spreads, but scoreDebitCandidate
+            // uses opts.debit (passed explicitly) and does NOT rely on metrics.credit being positive
             metrics = computeCandidateMetrics(candidate, rv_30d, iv_30d);
             
             // Debug logging before scoring
@@ -610,7 +672,7 @@ export async function generateProposal(
             scoring = scoreDebitCandidate(metrics, {
               mode,
               trendScore,
-              debit: candidate.debit ?? Math.abs(candidate.credit),
+              debit: candidate.debit ?? Math.abs(candidate.credit), // Use explicit debit, not metrics.credit
               width: candidate.width,
             });
             effectiveScore = scoring.composite_score;
@@ -798,7 +860,7 @@ export async function generateProposal(
     
     // [9.5] Portfolio Net Credit Check - ensure we stay net-credit after this trade
     // Filter out candidates that would make portfolio net-debit
-    const portfolioFiltered = await filterByPortfolioNetCredit(env, passing, requiredCredit);
+    const portfolioFiltered = await filterByPortfolioNetCredit(env, passing);
     
     // Sort all scored candidates by score (for fallback)
     const allScoredSorted = [...scoredCandidates].sort((a, b) => {
@@ -953,7 +1015,44 @@ export async function generateProposal(
       status: 'READY',
     };
     
+    // CRITICAL: Log proposal creation with strategy before persisting
+    console.log('[proposals] creating_proposal', JSON.stringify({
+      proposal_id: proposal.id,
+      symbol: proposal.symbol,
+      strategy: proposal.strategy,
+      expiration: proposal.expiration,
+      short_strike: proposal.short_strike,
+      long_strike: proposal.long_strike,
+      credit_target: proposal.credit_target,
+      score: proposal.score,
+      candidate_strategy: bestCandidate.strategy,
+      strategy_match: proposal.strategy === bestCandidate.strategy,
+      note: 'Strategy must match candidate strategy exactly',
+    }));
+    
     const persistedProposal = await insertProposal(env, proposal);
+    
+    // CRITICAL: Verify strategy was persisted correctly
+    if (persistedProposal.strategy !== proposal.strategy) {
+      console.error('[proposals] CRITICAL: Strategy mismatch after persistence', JSON.stringify({
+        proposal_id: persistedProposal.id,
+        expected_strategy: proposal.strategy,
+        persisted_strategy: persistedProposal.strategy,
+        error: 'Strategy changed during persistence - this should never happen',
+      }));
+    }
+    
+    console.log('[proposals] proposal_created', JSON.stringify({
+      proposal_id: persistedProposal.id,
+      symbol: persistedProposal.symbol,
+      strategy: persistedProposal.strategy,
+      expiration: persistedProposal.expiration,
+      score: persistedProposal.score,
+      credit_target: persistedProposal.credit_target,
+      status: persistedProposal.status,
+      note: 'Proposal created successfully - strategy is immutable',
+    }));
+    
     const tradingMode = await getTradingMode(env);
     await notifyProposalCreated(env, tradingMode, persistedProposal);
     
@@ -1640,8 +1739,7 @@ export function computeCandidateMetrics(
  */
 async function filterByPortfolioNetCredit(
   env: Env,
-  candidates: ProposalCandidate[],
-  minCredit: number
+  candidates: ProposalCandidate[]
 ): Promise<ProposalCandidate[]> {
   // Get all OPEN trades
   const openTrades = await getOpenTrades(env);

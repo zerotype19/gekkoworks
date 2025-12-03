@@ -6,7 +6,7 @@
  */
 
 import type { Env } from '../env';
-import { getRecentProposals, getRecentBrokerEvents, getAllTrades } from '../db/queries';
+import { getRecentProposals, getRecentBrokerEvents, getAllTrades, getProposal, getOrdersByProposalId } from '../db/queries';
 import { getStrategyThresholds } from '../core/config';
 
 export async function handleProposalsAndOrders(
@@ -33,11 +33,33 @@ export async function handleProposalsAndOrders(
     // Get current thresholds for context
     const thresholds = await getStrategyThresholds(env);
 
-    // Build a map of proposal_id -> trade
+    // Build a map of proposal_id -> trade (direct link)
     const proposalToTrade = new Map<string, typeof allTrades[0]>();
     for (const trade of allTrades) {
       if (trade.proposal_id) {
         proposalToTrade.set(trade.proposal_id, trade);
+      }
+    }
+    
+    // Also build a map by symbol/strikes/expiration/strategy for trades without proposal_id
+    // (created by portfolioSync - these should still be linked to matching proposals)
+    const tradeKeyToTrade = new Map<string, typeof allTrades[0]>();
+    for (const trade of allTrades) {
+      if (!trade.proposal_id) {
+        // Create a key: symbol-expiration-short_strike-long_strike-strategy
+        // CRITICAL: Include strategy to avoid matching wrong trades (e.g., BULL_CALL_DEBIT vs BULL_PUT_CREDIT)
+        const strategy = trade.strategy || 'BULL_PUT_CREDIT';
+        const key = `${trade.symbol}-${trade.expiration}-${trade.short_strike}-${trade.long_strike}-${strategy}`;
+        // Only add if we don't already have a trade for this key (prefer the most recent)
+        if (!tradeKeyToTrade.has(key)) {
+          tradeKeyToTrade.set(key, trade);
+        } else {
+          // If we have multiple trades for same key, prefer the one with a broker_order_id_open
+          const existing = tradeKeyToTrade.get(key)!;
+          if (trade.broker_order_id_open && !existing.broker_order_id_open) {
+            tradeKeyToTrade.set(key, trade);
+          }
+        }
       }
     }
 
@@ -65,10 +87,50 @@ export async function handleProposalsAndOrders(
     );
 
     // Format proposals with their orders and rationale
-    const formattedProposals = proposals.map(proposal => {
-      const trade = proposalToTrade.get(proposal.id);
+    const formattedProposals = await Promise.all(proposals.map(async (proposal) => {
+      // Get orders for this proposal from the orders table (source of truth)
+      const orders = await getOrdersByProposalId(env, proposal.id);
       
-      // Find broker events for this proposal's trade
+      // Find entry and exit orders
+      const entryOrder = orders.find(o => o.side === 'ENTRY');
+      const exitOrder = orders.find(o => o.side === 'EXIT');
+      
+      // Get linked trade (from proposal.linked_trade_id for exits, or from entry order for entries)
+      // CRITICAL: Always validate strategy matches to prevent showing wrong trades
+      const proposalStrategy = proposal.strategy || 'BULL_PUT_CREDIT';
+      let trade = null;
+      if (proposal.kind === 'EXIT' && proposal.linked_trade_id) {
+        const candidateTrade = allTrades.find(t => t.id === proposal.linked_trade_id) || null;
+        // Validate strategy matches
+        if (candidateTrade && (candidateTrade.strategy || 'BULL_PUT_CREDIT') === proposalStrategy) {
+          trade = candidateTrade;
+        }
+      } else if (entryOrder && entryOrder.trade_id) {
+        const candidateTrade = allTrades.find(t => t.id === entryOrder.trade_id) || null;
+        // Validate strategy matches
+        if (candidateTrade && (candidateTrade.strategy || 'BULL_PUT_CREDIT') === proposalStrategy) {
+          trade = candidateTrade;
+        }
+      } else {
+        // Fallback: try direct proposal_id match
+        const candidateTrade = proposalToTrade.get(proposal.id);
+        // Validate strategy matches
+        if (candidateTrade && (candidateTrade.strategy || 'BULL_PUT_CREDIT') === proposalStrategy) {
+          trade = candidateTrade;
+        }
+        
+        // If no direct match, try matching by symbol/strikes/expiration/strategy
+        // CRITICAL: Include strategy to avoid matching wrong trades (e.g., BULL_CALL_DEBIT vs BULL_PUT_CREDIT)
+        if (!trade) {
+          const tradeKey = `${proposal.symbol}-${proposal.expiration}-${proposal.short_strike}-${proposal.long_strike}-${proposalStrategy}`;
+          const matchedTrade = tradeKeyToTrade.get(tradeKey);
+          if (matchedTrade) {
+            trade = matchedTrade;
+          }
+        }
+      }
+      
+      // Find broker events for this proposal's trade (for backward compatibility)
       const entryOrderEvents: typeof brokerEvents = [];
       const exitOrderEvents: typeof brokerEvents = [];
       
@@ -111,19 +173,41 @@ export async function handleProposalsAndOrders(
         outcome = 'INVALIDATED';
         outcomeReason = 'Proposal invalidated before entry attempt';
       } else if (proposal.status === 'CONSUMED' && trade) {
-        if (trade.status === 'OPEN') {
+        if (trade.status === 'OPEN' || trade.status === 'CLOSING_PENDING') {
           outcome = 'FILLED';
           outcomeReason = 'Order filled successfully';
-        } else if (trade.status === 'CANCELLED' || trade.status === 'CLOSE_FAILED') {
+        } else if (trade.status === 'CLOSED') {
+          outcome = 'FILLED';
+          outcomeReason = 'Order filled and trade closed';
+        } else if (trade.status === 'CANCELLED' || trade.status === 'CLOSE_FAILED' || trade.status === 'EXIT_ERROR') {
           outcome = 'REJECTED';
           outcomeReason = trade.exit_reason || 'Order cancelled or failed';
         } else if (trade.status === 'ENTRY_PENDING') {
           outcome = 'PENDING';
           outcomeReason = 'Order pending fill';
+        } else {
+          // CONSUMED but trade has unexpected status
+          outcome = 'FILLED';
+          outcomeReason = `Trade exists with status: ${trade.status}`;
         }
+      } else if (proposal.status === 'CONSUMED' && !trade) {
+        // Proposal was CONSUMED but no trade found (shouldn't happen, but handle gracefully)
+        outcome = 'NOT_ATTEMPTED';
+        outcomeReason = 'Proposal marked CONSUMED but no matching trade found';
       } else if (proposal.status === 'READY') {
-        outcome = 'PENDING';
-        outcomeReason = 'Proposal ready but not yet attempted';
+        // Check if there's a matching trade even though proposal is still READY
+        // (could happen if portfolioSync created trade before entry.ts processed proposal)
+        if (trade) {
+          outcome = 'FILLED';
+          outcomeReason = 'Trade exists (likely created by portfolioSync) but proposal still marked READY';
+        } else {
+          outcome = 'PENDING';
+          outcomeReason = 'Proposal ready but not yet attempted';
+        }
+      } else if (trade) {
+        // Trade exists but proposal status is unexpected - still show as FILLED
+        outcome = 'FILLED';
+        outcomeReason = `Trade exists but proposal status is ${proposal.status}`;
       }
 
       // Extract rejection reasons from logs
@@ -147,7 +231,31 @@ export async function handleProposalsAndOrders(
         }
       }
 
-      // Get broker response details
+      // Determine lifecycle status from order
+      let lifecycleStatus = 'No order placed';
+      if (entryOrder) {
+        if (entryOrder.status === 'PENDING' || entryOrder.status === 'PLACED') {
+          lifecycleStatus = 'Order sent – waiting';
+        } else if (entryOrder.status === 'FILLED') {
+          lifecycleStatus = trade && trade.status === 'OPEN' 
+            ? 'Entry filled – trade OPEN'
+            : 'Entry filled';
+        } else if (entryOrder.status === 'CANCELLED' || entryOrder.status === 'REJECTED') {
+          lifecycleStatus = `Entry ${entryOrder.status.toLowerCase()}`;
+        }
+      } else if (exitOrder) {
+        if (exitOrder.status === 'PENDING' || exitOrder.status === 'PLACED') {
+          lifecycleStatus = 'Exit order sent – waiting';
+        } else if (exitOrder.status === 'FILLED') {
+          lifecycleStatus = trade && trade.status === 'CLOSED'
+            ? 'Exit filled – trade CLOSED'
+            : 'Exit filled';
+        } else if (exitOrder.status === 'CANCELLED' || exitOrder.status === 'REJECTED') {
+          lifecycleStatus = `Exit ${exitOrder.status.toLowerCase()}`;
+        }
+      }
+
+      // Get broker response details (for backward compatibility)
       const entryOrderResponse = entryOrderEvents.find(e => e.operation === 'PLACE_ORDER');
       const entryOrderStatus = entryOrderEvents.find(e => e.operation === 'GET_ORDER');
 
@@ -174,10 +282,13 @@ export async function handleProposalsAndOrders(
           // Thresholds
           min_score_required: thresholds.minScore,
           min_credit_required: proposal.width * thresholds.minCreditFraction,
+          // New fields
+          proposalKind: proposal.kind || (proposal.linked_trade_id ? 'EXIT' : 'ENTRY'),
         },
         trade: trade ? {
           id: trade.id,
           status: trade.status,
+          strategy: trade.strategy || null,
           entry_price: trade.entry_price,
           exit_price: trade.exit_price,
           opened_at: trade.opened_at,
@@ -185,6 +296,14 @@ export async function handleProposalsAndOrders(
           broker_order_id_open: trade.broker_order_id_open,
           broker_order_id_close: trade.broker_order_id_close,
         } : null,
+        order: entryOrder || exitOrder ? {
+          status: (entryOrder || exitOrder)!.status,
+          side: (entryOrder || exitOrder)!.side,
+          avgFillPrice: (entryOrder || exitOrder)!.avg_fill_price,
+          tradierOrderId: (entryOrder || exitOrder)!.tradier_order_id,
+          clientOrderId: (entryOrder || exitOrder)!.client_order_id,
+        } : null,
+        lifecycleStatus,
         outcome,
         outcomeReason,
         rejectionReasons,
@@ -221,7 +340,7 @@ export async function handleProposalsAndOrders(
           details: log.details,
         })),
       };
-    });
+    }));
 
     return new Response(
       JSON.stringify({

@@ -47,19 +47,24 @@ interface ReconciliationResult {
 
 /**
  * Match a Tradier position to a local trade
+ * 
+ * NOTE: This function is used for individual position matching, but the main
+ * reconciliation logic uses groupPositionsIntoSpreads which handles all strategy types.
+ * This function is kept for backward compatibility but may not be used in the main flow.
  */
 function matchPositionToTrade(
   position: { symbol: string; quantity: number; cost_basis: number | null },
   trades: TradeRow[]
 ): TradeRow | null {
   const parsed = parseOptionSymbol(position.symbol);
-  if (!parsed || parsed.type !== 'put') {
-    return null; // Only match puts for BPCS
+  if (!parsed) {
+    return null; // Can't parse option symbol
   }
   
   // Find trade with matching symbol, expiration, and strike
   // For short positions (quantity < 0), match to short_strike
   // For long positions (quantity > 0), match to long_strike
+  // Note: We match regardless of option type (put/call) since trades can be either
   if (position.quantity < 0) {
     // Short position - match to short_strike
     return trades.find(
@@ -189,7 +194,7 @@ export async function handleAdminReconcile(request: Request, env: Env): Promise<
         }
         
         // Check for spread width mismatch
-        const tradierWidth = matchingSpread.short_strike - matchingSpread.long_strike;
+        const tradierWidth = Math.abs(matchingSpread.short_strike - matchingSpread.long_strike);
         if (tradierWidth !== trade.width) {
           mismatches.push({
             type: 'spread_width_mismatch',
@@ -237,34 +242,87 @@ export async function handleAdminReconcile(request: Request, env: Env): Promise<
         
         if (autoRepair) {
           // Create trade record from Tradier position
-          const entryPrice = spread.short_cost_basis && spread.long_cost_basis
-            ? (Math.abs(spread.short_cost_basis) - Math.abs(spread.long_cost_basis)) / 100 / spread.short_quantity
-            : null;
-          
-          const newTrade: Omit<TradeRow, 'created_at' | 'updated_at'> = {
-            id: crypto.randomUUID(),
-            proposal_id: null,
-            symbol: spread.symbol,
-            expiration: spread.expiration,
-            short_strike: spread.short_strike,
-            long_strike: spread.long_strike,
-            width: spread.short_strike - spread.long_strike,
-            quantity: spread.short_quantity,
-            entry_price: entryPrice,
-            exit_price: null,
-            max_profit: entryPrice ? entryPrice * spread.short_quantity : null,
-            max_loss: entryPrice ? (spread.short_strike - spread.long_strike - entryPrice) * spread.short_quantity : null,
-            status: 'OPEN',
-            exit_reason: null,
-            broker_order_id_open: null,
-            broker_order_id_close: null,
-            opened_at: now.toISOString(),
-            closed_at: null,
-            realized_pnl: null,
-          };
-          
-          await insertTrade(env, newTrade);
-          repaired.push(mismatches[mismatches.length - 1]);
+          // We need to determine strategy and calculate entry price correctly
+          // Use the same logic as portfolioSync
+          try {
+            const chain = await broker.getOptionChain(spread.symbol, spread.expiration);
+            const shortOption = chain.find(opt => opt.strike === spread.short_strike);
+            const longOption = chain.find(opt => opt.strike === spread.long_strike);
+            
+            if (!shortOption || !longOption || shortOption.type !== longOption.type) {
+              throw new Error('Cannot determine option type from chain');
+            }
+            
+            const optionType = shortOption.type;
+            let strategy: string;
+            if (optionType === 'put') {
+              strategy = spread.short_strike > spread.long_strike ? 'BULL_PUT_CREDIT' : 'BEAR_PUT_DEBIT';
+            } else {
+              strategy = spread.short_strike < spread.long_strike ? 'BEAR_CALL_CREDIT' : 'BULL_CALL_DEBIT';
+            }
+            
+            const isCreditSpread = strategy === 'BULL_PUT_CREDIT' || strategy === 'BEAR_CALL_CREDIT';
+            let entryPrice: number | null = null;
+            
+            if (spread.short_cost_basis !== null && spread.long_cost_basis !== null && spread.short_quantity > 0) {
+              const shortCents = Math.abs(spread.short_cost_basis);
+              const longCents = Math.abs(spread.long_cost_basis);
+              const netPremiumCents = isCreditSpread 
+                ? shortCents - longCents
+                : longCents - shortCents;
+              entryPrice = Math.abs(netPremiumCents) / 100 / spread.short_quantity;
+              
+              if (entryPrice < 0.20 || entryPrice > 3.00) {
+                entryPrice = null; // Invalid, don't set it
+              }
+            }
+            
+            let maxProfit: number | null = null;
+            let maxLoss: number | null = null;
+            const width = Math.abs(spread.short_strike - spread.long_strike);
+            
+            if (entryPrice) {
+              if (isCreditSpread) {
+                maxProfit = entryPrice * spread.short_quantity;
+                maxLoss = (width - entryPrice) * spread.short_quantity;
+              } else {
+                maxLoss = entryPrice * spread.short_quantity;
+                maxProfit = (width - entryPrice) * spread.short_quantity;
+              }
+            }
+            
+            const newTrade: Omit<TradeRow, 'created_at' | 'updated_at'> = {
+              id: crypto.randomUUID(),
+              proposal_id: null,
+              symbol: spread.symbol,
+              expiration: spread.expiration,
+              short_strike: spread.short_strike,
+              long_strike: spread.long_strike,
+              width: width,
+              quantity: spread.short_quantity,
+              entry_price: entryPrice,
+              exit_price: null,
+              max_profit: maxProfit,
+              max_loss: maxLoss,
+              strategy: strategy as any,
+              status: 'OPEN',
+              exit_reason: null,
+              broker_order_id_open: null,
+              broker_order_id_close: null,
+              opened_at: now.toISOString(),
+              closed_at: null,
+              realized_pnl: null,
+            };
+            
+            await insertTrade(env, newTrade);
+            repaired.push(mismatches[mismatches.length - 1]);
+          } catch (error) {
+            console.error('[reconcile] failed to create trade from position', JSON.stringify({
+              error: error instanceof Error ? error.message : String(error),
+              spread,
+            }));
+            // Don't add to repaired if we couldn't create the trade
+          }
         }
       }
     }

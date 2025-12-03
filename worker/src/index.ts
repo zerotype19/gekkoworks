@@ -22,6 +22,8 @@ import { handleDebugHealthDb } from './http/debugHealthDb';
 import { handleDebugForceExit } from './http/debugForceExit';
 import { handleDebugTestClosePosition } from './http/debugTestClosePosition';
 import { handleDebugExitRules } from './http/debugExitRules';
+import { handleDebugExitPayload } from './http/debugExitPayload';
+import { handleDebugTradierSnapshot } from './http/debugTradierSnapshot';
 import { handleDebugCreateTestTrade } from './http/debugCreateTestTrade';
 import { handleDebugInitExitRules } from './http/debugInitExitRules';
 import { handleDebugSystemMode } from './http/debugSystemMode';
@@ -37,8 +39,20 @@ import { handleAdminRepairPortfolio } from './http/adminRepairPortfolio';
 import { handleAdminReconcile } from './http/adminReconcile';
 import { handleAdminGetSettings, handleAdminUpdateSetting } from './http/adminSettings';
 import { handleDebugPortfolioSync } from './http/debugPortfolioSync';
+import { handlePortfolioPositions } from './http/portfolioPositions';
 import { handleDebugUpdateQuantities } from './http/debugUpdateQuantities';
 import { handleDebugBackfillEntryPrices } from './http/debugBackfillEntryPrices';
+import { handleDebugBackfillMissingTrades } from './http/debugBackfillMissingTrades';
+import { handleDebugBackfillExitPrices } from './http/debugBackfillExitPrices';
+import { handleDebugCompareTradierClosed } from './http/debugCompareTradierClosed';
+import { handleDebugAnalyzeTradesVsTradier } from './http/debugAnalyzeTradesVsTradier';
+import { handleDebugAnalyzeTradesDetailed } from './http/debugAnalyzeTradesDetailed';
+import { handleDebugComparePortfolioPositions } from './http/debugComparePortfolioPositions';
+import { handleDebugCleanupStalePositions } from './http/debugCleanupStalePositions';
+import { handleDebugForcePortfolioSync } from './http/debugForcePortfolioSync';
+import { handleDebugTradeHistory } from './http/debugTradeHistory';
+import { handleDebugBrokerEvents } from './http/debugBrokerEvents';
+import { handleDebugTableSchema } from './http/debugTableSchema';
 import { handleDebugRegime } from './http/debugRegime';
 import { handleDebugStrategyStatus } from './http/debugStrategyStatus';
 import { handleDebugLiveSignals } from './http/debugLiveSignals';
@@ -49,6 +63,22 @@ import { handleDebugCleanupPriceSnaps } from './http/debugCleanupPriceSnaps';
 import { handleDebugRemoveStrategyWhitelist } from './http/debugRemoveStrategyWhitelist';
 import { handleDebugEnableAutoMode } from './http/debugEnableAutoMode';
 import { handleDebugRemoveSymbolWhitelist } from './http/debugRemoveSymbolWhitelist';
+import { handleDebugSetConcentrationLimits } from './http/debugSetConcentrationLimits';
+import { handleDebugConcentration } from './http/debugConcentration';
+import { handleDebugStrategyInvariants } from './http/debugStrategyInvariants';
+import { handleDebugFixTradeStrategies } from './http/debugFixTradeStrategies';
+import { handleDebugTraceOrder } from './http/debugTraceOrder';
+import { handleDebugTraceExitAttempts } from './http/debugTraceExitAttempts';
+import { handleDebugInvestigateIssues } from './http/debugInvestigateIssues';
+import { handleDebugSyncPendingOrders } from './http/debugSyncPendingOrders';
+import { handleDebugVerifyPositionsMonitoring } from './http/debugVerifyPositionsMonitoring';
+import { handleDebugTestMonitoringWithPortfolio } from './http/debugTestMonitoringWithPortfolio';
+import { handleDebugSyncTradeQuantities } from './http/debugSyncTradeQuantities';
+import { handleDebugWhyNoProposals } from './http/debugWhyNoProposals';
+import { handleDebugDailyRecap } from './http/debugDailyRecap';
+import { handleDebugInvestigateEmergencyExits } from './http/debugInvestigateEmergencyExits';
+import { handleDailySummary } from './http/dailySummary';
+import { handleDebugDoubleDailyLimits } from './http/debugDoubleDailyLimits';
 
 // Cron handlers
 import { runPremarketCheck } from './cron/premarket';
@@ -56,6 +86,7 @@ import { runTradeCycle } from './cron/tradeCycle';
 import { runMonitorCycle } from './cron/monitorCycle';
 import { runAccountSync } from './cron/accountSync';
 import { runOrphanedOrderCleanup } from './cron/orphanedOrderCleanup';
+import { runDailySummary } from './cron/dailySummary';
 
 // Test handlers
 async function handleTestProposal(
@@ -477,12 +508,65 @@ export default {
     } else if (path === '/debug/remove-symbol-whitelist' && request.method === 'POST') {
       // Remove symbol whitelist to allow all eligible symbols (SANDBOX_PAPER only)
       response = await handleDebugRemoveSymbolWhitelist(request, env, ctx);
+    } else if (path === '/debug/set-concentration-limits' && (request.method === 'GET' || request.method === 'POST')) {
+      // Initialize concentration limit settings with defaults
+      response = await handleDebugSetConcentrationLimits(env);
+    } else if (path === '/debug/double-daily-limits' && (request.method === 'GET' || request.method === 'POST')) {
+      // Double all daily limits for testing
+      response = await handleDebugDoubleDailyLimits(request, env);
+    } else if (path === '/debug/concentration' && request.method === 'GET') {
+      // Debug endpoint to show current concentration state for all symbols
+      response = await handleDebugConcentration(env);
+    } else if (path === '/debug/strategy-invariants' && request.method === 'GET') {
+      // Debug endpoint to audit strategy invariants across all trades
+      response = await handleDebugStrategyInvariants(request, env);
+    } else if (path === '/debug/fix-trade-strategies' && request.method === 'GET') {
+      // Fix trades with incorrect strategies (matches to proposals)
+      response = await handleDebugFixTradeStrategies(request, env);
+    } else if (path === '/debug/trace-order' && request.method === 'GET') {
+      // Trace order from proposal through fill to trade
+      response = await handleDebugTraceOrder(request, env);
+    } else if (path === '/debug/trace-exit-attempts' && request.method === 'GET') {
+      // Trace all exit attempts for a trade
+      response = await handleDebugTraceExitAttempts(request, env);
+    } else if (path === '/debug/investigate-issues' && request.method === 'GET') {
+      // Investigate monitoring, order sync, and proposal invalidation issues
+      response = await handleDebugInvestigateIssues(request, env);
+    } else if (path === '/debug/sync-pending-orders' && request.method === 'GET') {
+      // Manually sync orders that are out of sync with Tradier
+      response = await handleDebugSyncPendingOrders(request, env);
+    } else if (path === '/debug/verify-positions-monitoring' && request.method === 'GET') {
+      // Verify all Tradier positions are being monitored
+      response = await handleDebugVerifyPositionsMonitoring(request, env);
+    } else if (path === '/debug/test-monitoring-with-portfolio' && request.method === 'GET') {
+      // Test if monitoring can find portfolio positions for trades
+      response = await handleDebugTestMonitoringWithPortfolio(request, env);
+    } else if (path === '/debug/sync-trade-quantities' && request.method === 'GET') {
+      // Sync trade quantities from portfolio positions
+      response = await handleDebugSyncTradeQuantities(request, env);
+    } else if (path === '/debug/why-no-proposals' && request.method === 'GET') {
+      // Debug endpoint to diagnose why no proposals were generated today
+      response = await handleDebugWhyNoProposals(request, env);
     } else if (path === '/debug/enable-auto-mode' && (request.method === 'GET' || request.method === 'POST')) {
       // Check and enable auto mode
       response = await handleDebugEnableAutoMode(request, env, ctx);
     } else if (path === '/debug/exit-rules' && request.method === 'GET') {
       // View all exit rule config values
       response = await handleDebugExitRules(request, env);
+    } else if (path.match(/^\/debug\/exit\/([^\/]+)$/) && request.method === 'GET') {
+      // Inspect exit order payload for a trade
+      const tradeId = path.match(/^\/debug\/exit\/([^\/]+)$/)?.[1];
+      if (tradeId) {
+        response = await handleDebugExitPayload(request, env, ctx);
+      } else {
+        response = new Response(
+          JSON.stringify({ error: 'Invalid trade ID' }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+    } else if (path === '/debug/tradier/snapshot' && request.method === 'GET') {
+      // Inspect latest Tradier snapshot or trigger new sync
+      response = await handleDebugTradierSnapshot(request, env, ctx);
     } else if (path === '/debug/create-test-trade' && request.method === 'POST') {
       // Create a test OPEN trade for testing exit functionality
       response = await handleDebugCreateTestTrade(request, env);
@@ -510,6 +594,12 @@ export default {
     } else if (path === '/debug/monitor' && request.method === 'GET') {
       // Debug endpoint to manually trigger a monitor cycle
       response = await handleDebugMonitor(request, env, ctx);
+    } else if (path === '/portfolio-positions' && request.method === 'GET') {
+      // Read-only endpoint to get portfolio positions
+      response = await handlePortfolioPositions(request, env);
+    } else if ((path === '/daily-summary' || path === '/v2/daily-summary') && (request.method === 'GET' || request.method === 'POST')) {
+      // Daily activity summary endpoint - generate and retrieve summaries
+      response = await handleDailySummary(request, env, ctx);
     } else if (path === '/debug/portfolio-sync' && request.method === 'GET') {
       // Debug endpoint to test portfolio sync and show detailed info
       response = await handleDebugPortfolioSync(request, env);
@@ -519,6 +609,45 @@ export default {
     } else if (path === '/debug/backfill-entry-prices' && request.method === 'POST') {
       // Debug endpoint to backfill entry_price for trades missing it
       response = await handleDebugBackfillEntryPrices(request, env);
+    } else if (path === '/v2/debug/backfill-missing-trades' && request.method === 'POST') {
+      // Debug endpoint to backfill missing trades for positions without matching trades
+      response = await handleDebugBackfillMissingTrades(request, env);
+    } else if (path === '/v2/debug/backfill-exit-prices' && (request.method === 'GET' || request.method === 'POST')) {
+      // Debug endpoint to backfill missing exit prices for closed trades
+      response = await handleDebugBackfillExitPrices(request, env, ctx);
+    } else if (path === '/v2/debug/compare-tradier-closed' && request.method === 'GET') {
+      // Debug endpoint to compare our closed trades with Tradier's gain/loss data
+      response = await handleDebugCompareTradierClosed(request, env);
+    } else if (path === '/v2/debug/analyze-trades-vs-tradier' && request.method === 'GET') {
+      // Comprehensive analysis of D1 trades vs Tradier orders/positions
+      response = await handleDebugAnalyzeTradesVsTradier(request, env);
+    } else if (path === '/v2/debug/analyze-trades-detailed' && request.method === 'GET') {
+      // Detailed D1 database analysis
+      response = await handleDebugAnalyzeTradesDetailed(request, env);
+    } else if (path === '/v2/debug/compare-portfolio-positions' && request.method === 'GET') {
+      // Compare Tradier positions with portfolio_positions table
+      response = await handleDebugComparePortfolioPositions(request, env);
+    } else if (path === '/v2/debug/cleanup-stale-positions' && request.method === 'POST') {
+      // Clean up stale portfolio positions (manual cleanup)
+      response = await handleDebugCleanupStalePositions(request, env);
+    } else if (path === '/v2/debug/force-portfolio-sync' && request.method === 'POST') {
+      // Force a portfolio sync and show what was deleted
+      response = await handleDebugForcePortfolioSync(request, env);
+    } else if (path === '/v2/debug/trade-history' && request.method === 'GET') {
+      // Debug endpoint to query trade history by symbol, status, date range
+      response = await handleDebugTradeHistory(request, env);
+    } else if (path === '/v2/debug/broker-events' && request.method === 'GET') {
+      // Debug endpoint to query broker events by symbol, order_id, date range
+      response = await handleDebugBrokerEvents(request, env);
+    } else if (path === '/v2/debug/table-schema' && request.method === 'GET') {
+      // Debug endpoint to query table schema from D1
+      response = await handleDebugTableSchema(request, env);
+    } else if (path === '/v2/debug/daily-recap' && request.method === 'GET') {
+      // Debug endpoint to get today's trading activity recap
+      response = await handleDebugDailyRecap(request, env, ctx);
+    } else if (path === '/v2/debug/investigate-emergency-exits' && request.method === 'GET') {
+      // Debug endpoint to investigate EMERGENCY exits and expired/cancelled orders
+      response = await handleDebugInvestigateEmergencyExits(request, env, ctx);
     } else if (path === '/debug/migrate-tradier-first' && (request.method === 'POST' || request.method === 'GET')) {
       // One-time migration: realign D1 with Tradier positions - supports both GET and POST
       const { runTradierFirstMigration } = await import('./scripts/migrate-tradier-first');
@@ -587,6 +716,9 @@ export default {
     } else if (cron === '0 14 * * MON-FRI' || cron === '0 17 * * MON-FRI' || cron === '0 20 * * MON-FRI') {
       // Orphaned order cleanup (runs 3 times per day: 10:00, 13:00, 16:00 ET)
       await runOrphanedOrderCleanup(env, now);
+    } else if (cron === '15 20 * * MON-FRI') {
+      // Daily activity summary (runs at 4:15 PM ET)
+      await runDailySummary(env, now);
     } else {
       // Unknown cron - log but don't fail
       console.warn(`Unknown cron schedule: ${cron}`);

@@ -86,24 +86,24 @@ export default function BrokerActivityPage() {
             <table className="min-w-full divide-y divide-gray-200">
               <thead className="bg-gray-50">
                 <tr>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-8">
+                  <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-8">
                   </th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-24">
                     Time
                   </th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-20">
                     Type
                   </th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider min-w-[200px]">
                     Operation / Message
                   </th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-20">
                     Symbol
                   </th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-20">
                     Status
                   </th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-24">
                     Duration (ms)
                   </th>
                 </tr>
@@ -121,26 +121,26 @@ export default function BrokerActivityPage() {
                           className="hover:bg-gray-50 cursor-pointer"
                           onClick={() => toggleRow(rowId)}
                         >
-                          <td className="px-4 py-3 whitespace-nowrap">
-                            <span className="text-gray-400">
+                          <td className="px-2 py-2 whitespace-nowrap">
+                            <span className="text-gray-400 text-xs">
                               {isExpanded ? '▼' : '▶'}
                             </span>
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap text-xs text-gray-500">
+                          <td className="px-2 py-2 whitespace-nowrap text-xs text-gray-500">
                             {new Date(ev.created_at).toLocaleTimeString()}
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap">
-                            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800">
+                          <td className="px-2 py-2 whitespace-nowrap">
+                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800">
                               Broker
                             </span>
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap">
-                            <span className="font-mono text-xs text-gray-900">{ev.operation}</span>
+                          <td className="px-2 py-2 text-xs text-gray-900">
+                            <span className="font-mono truncate block max-w-[200px]">{ev.operation}</span>
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
+                          <td className="px-2 py-2 whitespace-nowrap text-xs text-gray-900">
                             {ev.symbol ?? '-'}
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap text-xs">
+                          <td className="px-2 py-2 whitespace-nowrap text-xs">
                             {ev.status_code ? (
                               <span className={ev.ok ? 'text-green-600' : 'text-red-600'}>
                                 {ev.status_code} {ev.ok ? '✅' : '⚠️'}
@@ -149,13 +149,13 @@ export default function BrokerActivityPage() {
                               <span className="text-gray-400">-</span>
                             )}
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap text-xs text-gray-500">
+                          <td className="px-2 py-2 whitespace-nowrap text-xs text-gray-500">
                             {ev.duration_ms ?? '-'}
                           </td>
                         </tr>
                         {isExpanded && (
                           <tr className="bg-gray-50">
-                            <td colSpan={7} className="px-4 py-3">
+                            <td colSpan={7} className="px-2 py-2">
                               <div className="text-xs space-y-1">
                                 <div><strong>Expiration:</strong> {ev.expiration ?? '-'}</div>
                                 <div><strong>Order ID:</strong> {ev.order_id ?? '-'}</div>
@@ -181,16 +181,16 @@ export default function BrokerActivityPage() {
                           className="hover:bg-gray-50 cursor-pointer"
                           onClick={() => toggleRow(rowId)}
                         >
-                          <td className="px-4 py-3 whitespace-nowrap">
-                            <span className="text-gray-400">
+                          <td className="px-2 py-2 whitespace-nowrap">
+                            <span className="text-gray-400 text-xs">
                               {isExpanded ? '▼' : '▶'}
                             </span>
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap text-xs text-gray-500">
+                          <td className="px-2 py-2 whitespace-nowrap text-xs text-gray-500">
                             {new Date(log.created_at).toLocaleTimeString()}
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap">
-                            <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+                          <td className="px-2 py-2 whitespace-nowrap">
+                            <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium ${
                               isTradeCycle ? 'bg-yellow-100 text-yellow-800' :
                               isProposalSummary ? 'bg-purple-100 text-purple-800' :
                               'bg-gray-100 text-gray-800'
@@ -198,28 +198,28 @@ export default function BrokerActivityPage() {
                               {log.log_type}
                             </span>
                           </td>
-                          <td className="px-4 py-3 text-xs text-gray-900">
-                            <div className="max-w-md truncate">{log.message}</div>
+                          <td className="px-2 py-2 text-xs text-gray-900">
+                            <div className="truncate max-w-[200px]">{log.message}</div>
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
+                          <td className="px-2 py-2 whitespace-nowrap text-xs text-gray-900">
                             {details?.symbol ?? '-'}
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap text-xs">
+                          <td className="px-2 py-2 whitespace-nowrap text-xs">
                             {details?.reason ? (
-                              <span className={details.reason.includes('ERROR') || details.reason.includes('FAILED') ? 'text-red-600' : 'text-yellow-600'}>
+                              <span className={`truncate block max-w-[80px] ${details.reason.includes('ERROR') || details.reason.includes('FAILED') ? 'text-red-600' : 'text-yellow-600'}`}>
                                 {details.reason}
                               </span>
                             ) : (
                               <span className="text-gray-400">-</span>
                             )}
                           </td>
-                          <td className="px-4 py-3 whitespace-nowrap text-xs text-gray-500">
+                          <td className="px-2 py-2 whitespace-nowrap text-xs text-gray-500">
                             -
                           </td>
                         </tr>
                         {isExpanded && (
                           <tr className="bg-gray-50">
-                            <td colSpan={7} className="px-4 py-3">
+                            <td colSpan={7} className="px-2 py-2">
                               <div className="text-xs space-y-2">
                                 <div><strong>Message:</strong> {log.message}</div>
                                 {details && (

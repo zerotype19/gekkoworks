@@ -11,9 +11,7 @@ import { TradierClient } from '../broker/tradierClient';
 import { insertAccountSnapshot } from '../db/queries';
 import { getETDateString } from '../core/time';
 import { getTradingMode } from '../core/config';
-import { syncPortfolioFromTradier } from '../engine/portfolioSync';
-import { syncOrdersFromTradier } from '../engine/orderSync';
-import { syncBalancesFromTradier } from '../engine/balancesSync';
+import { syncTradierSnapshot } from '../tradier/syncTradierSnapshot';
 
 /**
  * Run account snapshot sync
@@ -29,61 +27,43 @@ export async function runAccountSync(env: Env, now: Date): Promise<void> {
 
   const etDate = getETDateString(now);
 
-  // 1) Sync all data from Tradier (updates freshness timestamps)
+  // 1) Master sync from Tradier (updates all freshness timestamps)
   // This ensures all sync freshness is maintained even outside monitor/trade cycles
-  // We sync positions, orders, and balances to keep all timestamps fresh
+  // The master sync fetches positions, orders, and balances in a single coherent snapshot
   // 
   // CRITICAL: This sync is essential for exit logic to work correctly.
-  // Exit logic now checks Tradier positions directly, but this sync keeps
-  // our database in sync and updates freshness timestamps for monitoring.
+  // Exit logic uses the portfolio_positions mirror as its source of truth for quantities;
+  // this sync keeps that table and the freshness timestamps up to date.
   // Runs every 1 minute during market hours: */1 14-21 * * MON-FRI
   
-  let positionsSyncResult;
-  let ordersSyncResult;
-  let balancesSyncResult;
+  let syncResult;
+  let balances = { cash: 0, buying_power: 0, equity: 0, margin_requirement: 0 };
   
   try {
-    // Sync positions (updates positions sync freshness timestamp)
-    positionsSyncResult = await syncPortfolioFromTradier(env);
-    if (positionsSyncResult.errors.length > 0) {
-      console.error('[accountSync] positions sync had errors', JSON.stringify({
-        errors: positionsSyncResult.errors,
-      }));
-      // Continue anyway - non-fatal for snapshot
-    }
+    syncResult = await syncTradierSnapshot(env);
     
-    // Sync orders (updates orders sync freshness timestamp)
-    // Suppress orphaned order logs - they're handled by separate orphanedOrderCleanup cron
-    ordersSyncResult = await syncOrdersFromTradier(env, { suppressOrphanedLogs: true });
-    if (ordersSyncResult.errors.length > 0) {
-      console.error('[accountSync] orders sync had errors', JSON.stringify({
-        errors: ordersSyncResult.errors,
+    if (!syncResult.success) {
+      console.error('[accountSync] master sync failed', JSON.stringify({
+        errors: syncResult.errors,
+        warnings: syncResult.warnings,
+        note: 'Continuing with snapshot using stale data',
       }));
-      // Continue anyway - non-fatal for snapshot
-    }
-    
-    // Sync balances (updates balances sync freshness timestamp)
-    balancesSyncResult = await syncBalancesFromTradier(env);
-    if (!balancesSyncResult.success || !balancesSyncResult.balances) {
-      console.error('[accountSync] balances sync failed, continuing with snapshot', JSON.stringify({
-        errors: balancesSyncResult.errors,
+    } else {
+      balances = syncResult.snapshot?.balances || balances;
+      console.log('[accountSync] master sync completed', JSON.stringify({
+        snapshotId: syncResult.snapshot?.snapshotId,
+        positions: syncResult.snapshot?.counts.positions,
+        orders: syncResult.snapshot?.counts.orders,
+        balances_success: syncResult.snapshot?.balances !== null,
+        warnings: syncResult.warnings.length,
       }));
-      // Continue anyway - we'll use stale balances if needed
     }
-    
-    console.log('[accountSync] all syncs completed', JSON.stringify({
-      positions_synced: positionsSyncResult.synced,
-      orders_synced: ordersSyncResult.synced,
-      balances_success: balancesSyncResult.success,
-    }));
   } catch (error) {
     // Sync errors are logged but don't block snapshot creation
     console.error('[accountSync] sync error (non-fatal)', JSON.stringify({
       error: error instanceof Error ? error.message : String(error),
     }));
   }
-  
-  const balances = balancesSyncResult?.balances || { cash: 0, buying_power: 0, equity: 0, margin_requirement: 0 };
   
   // 2) Get positions data for snapshot
   // NOTE: This fetches positions again even though syncPortfolioFromTradier already called getPositions.
@@ -138,20 +118,39 @@ export async function runAccountSync(env: Env, now: Date): Promise<void> {
   }
 
   // 4) Persist snapshot
-  await insertAccountSnapshot(env, {
-    account_id: accountId,
-    mode,
-    date: etDate,
-    captured_at: now.toISOString(),
-    cash: balances.cash,
-    buying_power: balances.buying_power,
-    equity: balances.equity,
-    open_positions: openPositions,
-    trades_closed_today: tradesClosedToday,
-    realized_pnl_today: realizedToday,
-    realized_pnl_7d: null, // can be added later using internal or Tradier history
-    unrealized_pnl_open: unrealizedOpen,
-    source: 'TRADIER',
-  });
+  // CRITICAL: Wrap in try-catch to handle D1 rate limit errors gracefully
+  // If we've already made too many D1 operations (e.g., from orderSync), skip snapshot
+  try {
+    await insertAccountSnapshot(env, {
+      account_id: accountId,
+      mode,
+      date: etDate,
+      captured_at: now.toISOString(),
+      cash: balances.cash,
+      buying_power: balances.buying_power,
+      equity: balances.equity,
+      open_positions: openPositions,
+      trades_closed_today: tradesClosedToday,
+      realized_pnl_today: realizedToday,
+      realized_pnl_7d: null, // can be added later using internal or Tradier history
+      unrealized_pnl_open: unrealizedOpen,
+      source: 'TRADIER',
+    });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    // If it's a D1 rate limit error, log and continue (non-fatal)
+    // The sync operations already completed, so missing one snapshot is acceptable
+    if (errorMsg.includes('Too many API requests')) {
+      console.warn('[accountSync] skipped snapshot due to D1 rate limit', JSON.stringify({
+        error: errorMsg,
+        note: 'Sync operations completed - snapshot skipped to avoid rate limit',
+      }));
+    } else {
+      // Other errors should be logged as errors
+      console.error('[accountSync] failed to insert snapshot', JSON.stringify({
+        error: errorMsg,
+      }));
+    }
+  }
 }
 

@@ -63,6 +63,7 @@ export interface Trade {
   short_strike: number;
   long_strike: number;
   width: number;
+  strategy: string | null;
   entry_price: number | null;
   exit_price: number | null;
   max_profit: number | null;

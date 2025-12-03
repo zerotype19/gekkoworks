@@ -11,7 +11,7 @@
 
 import type { Env } from '../env';
 import { TradierClient } from '../broker/tradierClient';
-import { getOpenTrades } from '../db/queries';
+import { getOpenTrades, getAllPortfolioPositions } from '../db/queries';
 import { syncPortfolioFromTradier } from '../engine/portfolioSync';
 
 export async function handleDebugPortfolioSync(
@@ -29,10 +29,16 @@ export async function handleDebugPortfolioSync(
     // 2. Get our open trades
     const ourTrades = await getOpenTrades(env);
     
-    // 3. Run the actual sync to see what happens
+    // 3. Get portfolio_positions before sync
+    const portfolioPositionsBefore = await getAllPortfolioPositions(env);
+    
+    // 4. Run the actual sync to see what happens
     const syncResult = await syncPortfolioFromTradier(env);
     
-    // 4. Get trades again after sync
+    // 5. Get portfolio_positions after sync
+    const portfolioPositionsAfter = await getAllPortfolioPositions(env);
+    
+    // 6. Get trades again after sync
     const tradesAfterSync = await getOpenTrades(env);
     
     // 5. Group positions by expiration and strike for analysis
@@ -62,12 +68,25 @@ export async function handleDebugPortfolioSync(
           tradierPositions: positions.length,
           tradesBeforeSync: ourTrades.length,
           tradesAfterSync: tradesAfterSync.length,
+          portfolioPositionsBefore: portfolioPositionsBefore.length,
+          portfolioPositionsAfter: portfolioPositionsAfter.length,
           syncResult: {
+            success: syncResult.success,
             synced: syncResult.synced,
-            created: syncResult.created,
             errors: syncResult.errors.length,
           },
         },
+        portfolioPositions: portfolioPositionsAfter.map(p => ({
+          symbol: p.symbol,
+          expiration: p.expiration,
+          option_type: p.option_type,
+          strike: p.strike,
+          side: p.side,
+          quantity: p.quantity,
+          cost_basis_per_contract: p.cost_basis_per_contract,
+          last_price: p.last_price,
+          updated_at: p.updated_at,
+        })),
         rawPositions: positions.map(p => ({
           symbol: p.symbol,
           quantity: p.quantity,

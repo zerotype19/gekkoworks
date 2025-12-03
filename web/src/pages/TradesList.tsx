@@ -126,31 +126,37 @@ export default function TradesList() {
               <table className="min-w-full divide-y divide-gray-200">
                 <thead className="bg-gray-50">
                   <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       ID
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Symbol
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Strategy
+                    </th>
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Status
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      Proposal ID
+                    </th>
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Expiration
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Strikes
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Entry Price
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Exit Price
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       PnL
                     </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Closed
                     </th>
                   </tr>
@@ -158,47 +164,59 @@ export default function TradesList() {
                 <tbody className="bg-white divide-y divide-gray-200">
                   {trades.map((trade) => (
                     <tr key={trade.id} className="hover:bg-gray-50">
-                      <td className="px-6 py-4 whitespace-nowrap">
+                      <td className="px-4 py-2 whitespace-nowrap">
                         <Link
                           to={`/trades/${trade.id}`}
-                          className="text-blue-600 hover:text-blue-800 text-sm font-mono"
+                          className="text-blue-600 hover:text-blue-800 text-xs font-mono"
                         >
                           {trade.id.slice(0, 8)}...
                         </Link>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                      <td className="px-4 py-2 whitespace-nowrap text-xs font-medium text-gray-900">
                         {trade.symbol}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="flex items-center gap-2">
-                          <span className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${getStatusColor(trade.status)}`}>
+                      <td className="px-4 py-2 whitespace-nowrap text-xs text-gray-500">
+                        {trade.strategy || '-'}
+                      </td>
+                      <td className="px-4 py-2 whitespace-nowrap">
+                        <div className="flex items-center gap-1">
+                          <span className={`px-1.5 py-0.5 inline-flex text-xs leading-4 font-semibold rounded-full ${getStatusColor(trade.status)}`}>
                             {trade.status}
                           </span>
                           {isStuckClosing(trade) && (
-                            <span className="px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800" title="Close order pending for > 5 minutes">
-                              ⚠️ Stuck
+                            <span className="px-1.5 py-0.5 inline-flex text-xs leading-4 font-semibold rounded-full bg-red-100 text-red-800" title="Close order pending for > 5 minutes">
+                              ⚠️
                             </span>
                           )}
                           {isFullyClosed(trade) && (
-                            <span className="text-green-600" title="Trade fully closed with all data">
+                            <span className="text-green-600 text-xs" title="Trade fully closed with all data">
                               ✓
                             </span>
                           )}
                         </div>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      <td className="px-4 py-2 whitespace-nowrap text-xs">
+                        {trade.proposal_id ? (
+                          <span className="text-gray-500 font-mono text-xs" title={trade.proposal_id}>
+                            {trade.proposal_id.slice(0, 8)}...
+                          </span>
+                        ) : (
+                          <span className="text-gray-400">-</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2 whitespace-nowrap text-xs text-gray-500">
                         {new Date(trade.expiration).toLocaleDateString()}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      <td className="px-4 py-2 whitespace-nowrap text-xs text-gray-500">
                         {trade.short_strike} / {trade.long_strike}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                      <td className="px-4 py-2 whitespace-nowrap text-xs text-gray-900">
                         {trade.entry_price ? `$${trade.entry_price.toFixed(2)}` : '-'}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                      <td className="px-4 py-2 whitespace-nowrap text-xs text-gray-900">
                         {trade.exit_price ? `$${trade.exit_price.toFixed(2)}` : '-'}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm">
+                      <td className="px-4 py-2 whitespace-nowrap text-xs">
                         {trade.realized_pnl !== null ? (
                           <span className={trade.realized_pnl >= 0 ? 'text-green-600 font-semibold' : 'text-red-600 font-semibold'}>
                             ${trade.realized_pnl.toFixed(2)}
@@ -207,7 +225,7 @@ export default function TradesList() {
                           <span className="text-gray-400">-</span>
                         )}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      <td className="px-4 py-2 whitespace-nowrap text-xs text-gray-500">
                         {trade.closed_at ? (
                           <div>
                             <div>{new Date(trade.closed_at).toLocaleDateString()}</div>
@@ -248,6 +266,9 @@ export default function TradesList() {
                   </div>
                   <div className="grid grid-cols-2 gap-2 text-sm text-gray-600 mt-2">
                     <div>
+                      <span className="font-medium">Strategy:</span> {trade.strategy || '-'}
+                    </div>
+                    <div>
                       <span className="font-medium">Strikes:</span> {trade.short_strike} / {trade.long_strike}
                     </div>
                     <div>
@@ -255,6 +276,14 @@ export default function TradesList() {
                     </div>
                     <div>
                       <span className="font-medium">Exp:</span> {new Date(trade.expiration).toLocaleDateString()}
+                    </div>
+                    <div>
+                      <span className="font-medium">Proposal ID:</span>{' '}
+                      {trade.proposal_id ? (
+                        <span className="text-gray-500 font-mono text-xs">{trade.proposal_id.slice(0, 8)}...</span>
+                      ) : (
+                        <span className="text-gray-400">-</span>
+                      )}
                     </div>
                     <div>
                       <span className="font-medium">Exit:</span> {trade.exit_price ? `$${trade.exit_price.toFixed(2)}` : '-'}

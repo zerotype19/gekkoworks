@@ -37,6 +37,26 @@ export async function markTradeOpen(
     throw new Error(`Trade ${tradeId} not found`);
   }
   
+  // CRITICAL VALIDATION: Ensure entry_price is valid
+  if (!entryPrice || entryPrice <= 0) {
+    throw new Error(`markTradeOpen: entryPrice must be > 0, got ${entryPrice} for trade ${tradeId}`);
+  }
+  
+  // CRITICAL VALIDATION: Ensure proposal_id is set
+  if (!trade.proposal_id) {
+    throw new Error(`markTradeOpen: trade ${tradeId} missing proposal_id - all trades must have proposal_id`);
+  }
+  
+  // CRITICAL VALIDATION: Ensure strategy is set
+  if (!trade.strategy) {
+    throw new Error(`markTradeOpen: trade ${tradeId} missing strategy - all trades must have strategy`);
+  }
+  
+  // CRITICAL VALIDATION: Ensure broker_order_id_open is set
+  if (!trade.broker_order_id_open) {
+    throw new Error(`markTradeOpen: trade ${tradeId} missing broker_order_id_open - all trades must have Tradier order ID`);
+  }
+  
   // Compute max profit and max loss (per contract, then multiply by quantity)
   // Use configurable default if trade.quantity is not set
   const defaultQuantity = await getDefaultTradeQuantity(env);
@@ -65,6 +85,8 @@ export async function markTradeOpen(
   const max_profit = max_profit_per_contract * quantity;
   const max_loss = max_loss_per_contract * quantity;
   
+  // CRITICAL: Persist quantity if it was null to ensure consistency
+  // This prevents PnL/max_profit/max_loss from diverging if getDefaultTradeQuantity changes
   const updated = await updateTrade(env, tradeId, {
     status: 'OPEN',
     entry_price: entryPrice, // Store per-contract price
@@ -72,6 +94,7 @@ export async function markTradeOpen(
     max_profit,
     max_loss,
     iv_entry: ivEntry,
+    quantity, // Persist quantity to ensure consistency (even if it was null, now it's set to defaultQuantity)
   });
 
   console.log(
@@ -94,6 +117,9 @@ export async function markTradeOpen(
 
   // Validate spread invariants immediately after opening
   // This is a last-line-of-defense sanity check
+  // CRITICAL: We keep status as OPEN even if validation fails, so the trade is still monitored
+  // If structure is truly broken, repairPortfolio/monitorCycle will handle it
+  // Marking as INVALID_STRUCTURE would leave real broker positions unmanaged
   try {
     const validationResult = await validateSpreadInvariants(env, tradeId);
     if (!validationResult.valid) {
@@ -103,14 +129,13 @@ export async function markTradeOpen(
         trade_id: tradeId,
         reason: validationResult.reason,
         details: validationResult.details,
+        note: 'Trade remains OPEN to ensure monitoring continues - repairPortfolio/monitorCycle will handle structural issues',
       }));
       
-      await updateTrade(env, tradeId, {
-        status: 'INVALID_STRUCTURE',
-      });
-      
-      // Return the updated trade with invalid status
-      return await getTrade(env, tradeId) || updated;
+      // CRITICAL: Keep status as OPEN so trade is still monitored
+      // Don't mark as INVALID_STRUCTURE - that would leave real broker positions unmanaged
+      // The validation failure is logged for investigation, but the trade can still be closed normally
+      // If structure is truly broken, repairPortfolio or exit logic will catch it
     }
     // If valid === true, validation passed or was skipped due to broker error (will retry in next cycle)
   } catch (error) {
@@ -242,6 +267,10 @@ async function validateSpreadInvariants(
   }
   
   // Verify both legs exist in broker positions
+  // NOTE: For consistency with the rest of the system (monitorCycle, exits, phantom handling),
+  // we should ideally use getSpreadLegPositions + computeSpreadPositionSnapshot here.
+  // However, validation happens immediately after opening, so we use raw broker positions
+  // to catch issues before portfolio_positions is synced. This is acceptable for validation.
   const broker = new TradierClient(env);
   try {
     const positions = await broker.getPositions();
@@ -393,11 +422,16 @@ async function validateSpreadInvariants(
     // Second check: quantity must be at least the trade record quantity
     // Note: Tradier quantity may be higher if multiple trades share the same positions
     // We only fail if Tradier has LESS than expected (data integrity issue)
+    // 
+    // IMPORTANT: These quantity checks are only trusted at open time.
+    // Later, trades may have partial exits or scaling behavior, so we don't re-run
+    // these strict checks during monitoring/exit cycles.
     console.log('[lifecycle] quantity_check', JSON.stringify({
       trade_id: tradeId,
       shortQty,
       expectedQuantity,
       comparison: shortQty < expectedQuantity ? 'FAIL' : shortQty > expectedQuantity ? 'WARN' : 'PASS',
+      note: 'Quantity validation only trusted at open time - later partial exits/scaling may change quantities',
     }));
     
     if (shortQty < expectedQuantity) {
@@ -516,65 +550,113 @@ export async function markTradeClosingPending(
 }
 
 /**
- * Mark trade as CLOSED after exit fill
+ * Mark trade as CLOSED with explicit exit reason and optional PnL override
  * 
- * Per system-interfaces.md:
- * export async function markTradeClosed(
- *   env: Env,
- *   tradeId: string,
- *   exitPrice: number,
- *   closedAt: Date,
- *   exitReason?: ExitReason
- * ): Promise<TradeRow>;
+ * Phase 3: New helper to support both normal exits and reconciliation scenarios.
+ * Allows phantom closes to set exit_price=null and realized_pnl=null.
+ * 
+ * Per Phase 3 spec:
+ * - If realizedPnlOverride is provided, use it (can be null).
+ * - Else if exitPrice and entry_price exist, compute PnL with debit/credit logic.
+ * - Else set realized_pnl = null (unknown).
  */
-export async function markTradeClosed(
+export async function markTradeClosedWithReason(
   env: Env,
   tradeId: string,
-  exitPrice: number,
+  exitPrice: number | null,
   closedAt: Date,
-  exitReason?: ExitReason
+  exitReason: ExitReason,
+  realizedPnlOverride?: number | null
 ): Promise<TradeRow> {
   const trade = await getTrade(env, tradeId);
   if (!trade) {
     throw new Error(`Trade ${tradeId} not found`);
   }
   
-  if (!trade.entry_price) {
-    throw new Error(`Trade ${tradeId} has no entry_price`);
+  // CRITICAL VALIDATION: Ensure proposal_id is set
+  // NOTE: We allow closing legacy trades without proposal_id (downgrade to warning)
+  // This prevents stranding trades that were created before proposal_id was required
+  // However, we still require it for opening (markTradeOpen) to maintain data integrity going forward
+  if (!trade.proposal_id) {
+    console.error('[lifecycle] missing_proposal_id_on_close', JSON.stringify({
+      trade_id: tradeId,
+      symbol: trade.symbol,
+      status: trade.status,
+      note: 'Trade missing proposal_id - allowing close for legacy/reconciliation trades, but this should not happen for engine-created trades',
+    }));
+    // Don't throw - allow closing legacy trades, but log the issue
   }
   
-  // Compute realized PnL (per trade, matching max_profit/max_loss units)
-  // Get quantity to multiply per-contract PnL
-  const defaultQuantity = await getDefaultTradeQuantity(env);
-  const quantity = trade.quantity ?? defaultQuantity;
+  // CRITICAL VALIDATION: Ensure strategy is set
+  if (!trade.strategy) {
+    throw new Error(`markTradeClosedWithReason: trade ${tradeId} missing strategy - all trades must have strategy`);
+  }
   
-  // Determine if this is a debit spread
-  const isDebitSpread = trade.strategy === 'BULL_CALL_DEBIT' || trade.strategy === 'BEAR_PUT_DEBIT';
+  // Validate exitPrice if provided (must be >= 0, but can be null for phantom closes)
+  if (exitPrice !== null && exitPrice < 0) {
+    throw new Error(`markTradeClosedWithReason: exitPrice must be >= 0 or null, got ${exitPrice} for trade ${tradeId}`);
+  }
   
-  // Calculate per-contract PnL
-  let perContractPnL: number;
-  if (isDebitSpread) {
-    // For debit spreads: entry_price is debit paid, exit_price is credit received
-    // PnL = exitPrice - entry_price (positive if we received more than we paid)
-    perContractPnL = exitPrice - trade.entry_price;
+  // Determine realized_pnl
+  let realized_pnl: number | null;
+  
+  if (realizedPnlOverride !== undefined) {
+    // Use provided override (can be null for phantom closes)
+    realized_pnl = realizedPnlOverride;
+  } else if (exitPrice !== null && trade.entry_price && trade.entry_price > 0) {
+    // Compute PnL from entry/exit prices
+    const defaultQuantity = await getDefaultTradeQuantity(env);
+    const quantity = trade.quantity ?? defaultQuantity;
+    
+    // Determine if this is a debit spread
+    const isDebitSpread = trade.strategy === 'BULL_CALL_DEBIT' || trade.strategy === 'BEAR_PUT_DEBIT';
+    
+    // Calculate per-contract PnL
+    let perContractPnL: number;
+    if (isDebitSpread) {
+      // For debit spreads: entry_price is debit paid, exit_price is credit received
+      // PnL = exitPrice - entry_price (positive if we received more than we paid)
+      perContractPnL = exitPrice - trade.entry_price;
+    } else {
+      // For credit spreads: entry_price is credit received, exit_price is debit paid
+      // PnL = entry_price - exitPrice (positive if we received more than we paid to close)
+      perContractPnL = trade.entry_price - exitPrice;
+    }
+    
+    // Multiply by quantity to get total realized PnL for the trade
+    realized_pnl = perContractPnL * quantity;
+    
+    // Validate calculated PnL
+    if (realized_pnl === null || realized_pnl === undefined || isNaN(realized_pnl)) {
+      throw new Error(`markTradeClosedWithReason: calculated realized_pnl is invalid (${realized_pnl}) for trade ${tradeId}`);
+    }
+    
+    // Debug log for PnL calculation validation
+    console.log('[lifecycle][pnl]', JSON.stringify({
+      trade_id: tradeId,
+      strategy: trade.strategy,
+      exit_reason: exitReason,
+      entry_price: trade.entry_price,
+      exit_price: exitPrice,
+      realized_pnl: realized_pnl,
+      per_contract_pnl: perContractPnL,
+      quantity: quantity,
+      is_debit_spread: isDebitSpread,
+      calculation: isDebitSpread 
+        ? `exitPrice (${exitPrice}) - entry_price (${trade.entry_price}) = ${perContractPnL} per contract`
+        : `entry_price (${trade.entry_price}) - exitPrice (${exitPrice}) = ${perContractPnL} per contract`,
+    }));
   } else {
-    // For credit spreads: entry_price is credit received, exit_price is debit paid
-    // PnL = entry_price - exitPrice (positive if we received more than we paid to close)
-    perContractPnL = trade.entry_price - exitPrice;
+    // Unknown PnL (phantom close, missing entry_price, etc.)
+    realized_pnl = null;
   }
-  
-  // Multiply by quantity to get total realized PnL for the trade
-  const realized_pnl = perContractPnL * quantity;
-  
-  // Use provided exit_reason, or preserve existing one, or default to UNKNOWN
-  const exitReasonToSet = exitReason ?? trade.exit_reason ?? 'UNKNOWN';
   
   const updated = await updateTrade(env, tradeId, {
     status: 'CLOSED',
-    exit_price: exitPrice,
+    exit_price: exitPrice, // Can be null for phantom closes
     closed_at: closedAt.toISOString(),
-    realized_pnl,
-    exit_reason: exitReasonToSet,
+    realized_pnl, // Can be null for phantom closes
+    exit_reason: exitReason,
   });
 
   console.log(
@@ -587,12 +669,16 @@ export async function markTradeClosed(
       exit_price: exitPrice,
       closed_at: closedAt.toISOString(),
       realized_pnl,
-      exit_reason: updated.exit_reason,
+      exit_reason: exitReason,
+      note: realized_pnl === null ? 'PnL unknown (phantom/reconciliation close)' : 'PnL calculated',
     }),
   );
 
-  const tradingMode = await getTradingMode(env);
-  await notifyExitFilled(env, tradingMode, updated);
+  // Only send notifications for normal exits with known PnL
+  if (realized_pnl !== null && exitPrice !== null) {
+    const tradingMode = await getTradingMode(env);
+    await notifyExitFilled(env, tradingMode, updated);
+  }
 
   // Clean up price snap entries for this trade (they're no longer needed)
   try {
@@ -612,6 +698,28 @@ export async function markTradeClosed(
   }
 
   return updated;
+}
+
+/**
+ * Mark trade as CLOSED after exit fill (normal exit path)
+ * 
+ * Phase 3: Thin wrapper for normal exits that always have exitPrice and computed PnL.
+ * 
+ * Per system-interfaces.md:
+ * export async function markTradeClosed(
+ *   env: Env,
+ *   tradeId: string,
+ *   exitPrice: number,
+ *   closedAt: Date
+ * ): Promise<TradeRow>;
+ */
+export async function markTradeClosed(
+  env: Env,
+  tradeId: string,
+  exitPrice: number,
+  closedAt: Date
+): Promise<TradeRow> {
+  return markTradeClosedWithReason(env, tradeId, exitPrice, closedAt, 'NORMAL_EXIT');
 }
 
 /**

@@ -133,8 +133,21 @@ export async function attemptEntryForLatestProposal(
         reason: validation.reason,
       }));
       await updateProposalStatus(env, proposal.id, 'INVALIDATED');
-      return { trade: null, reason: validation.reason };
+      await insertSystemLog(env, 'entry', '[entry][proposal][invalidated]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        strategy: proposal.strategy,
+        reason: validation.reason || 'Validation failed',
+        timestamp: now.toISOString(),
+      }));
+      return { trade: null, reason: validation.reason || 'Validation failed' };
     }
+    
+    // NOTE: Manual AAPL block removed - concentration limits are now enforced via:
+    // - MAX_SPREADS_PER_SYMBOL (default: 3 spreads per symbol)
+    // - MAX_QTY_PER_SYMBOL_PER_SIDE (default: 10 contracts per side per symbol)
+    // - MAX_TOTAL_QTY_PER_SYMBOL (default: 50 contracts total per symbol)
+    // All symbols, including AAPL, now use the same concentration limits.
     
     // 3. Check risk gates
     // NOTE: Risk gate behavior - which gates should invalidate vs leave READY:
@@ -196,6 +209,15 @@ export async function attemptEntryForLatestProposal(
         max_trade_quantity: maxTradeQuantity,
       }));
       await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+      await insertSystemLog(env, 'entry', '[entry][proposal][invalidated]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        strategy: proposal.strategy,
+        reason: `Quantity ${quantity} exceeds maximum ${maxTradeQuantity}`,
+        quantity,
+        max_trade_quantity: maxTradeQuantity,
+        timestamp: now.toISOString(),
+      }));
       return { trade: null, reason: `Quantity ${quantity} exceeds maximum ${maxTradeQuantity}` };
     }
     
@@ -211,15 +233,47 @@ export async function attemptEntryForLatestProposal(
     const optionSide = isPutStrategy ? (isShortPremium ? 'short_puts' : 'long_puts') : (isShortPremium ? 'short_calls' : 'long_calls');
     
     // Check MAX_SPREADS_PER_SYMBOL (default: 3)
+    // CRITICAL: This is the FIRST check, but we'll RE-CHECK immediately before trade creation
+    // to prevent race conditions from concurrent trade cycles
     const maxSpreadsPerSymbol = parseInt(
       (await getSetting(env, 'MAX_SPREADS_PER_SYMBOL')) || '3',
       10
     ) || 3;
+    // Filter trades for this symbol (getOpenTrades already excludes CANCELLED/CLOSED, but be explicit)
+    // CRITICAL: Include ENTRY_PENDING trades - they count toward concentration limits
+    // CRITICAL: EXCLUDE CLOSING_PENDING trades - they are in the process of closing and should not block new entries
+    // This ensures that exits can always proceed and don't artificially inflate concentration counts
     const existingSpreadsForSymbol = openTradesForConcentration.filter(t => 
-      t.symbol === proposal.symbol && 
-      t.status !== 'CANCELLED' && 
-      t.status !== 'CLOSED'
+      t.symbol === proposal.symbol &&
+      t.status !== 'CANCELLED' &&
+      t.status !== 'CLOSED' &&
+      t.status !== 'EXIT_ERROR' && // Also exclude exit errors
+      t.status !== 'CLOSING_PENDING' // Exclude trades that are closing - they shouldn't block new entries
     );
+    
+    // Log concentration check for debugging - include ALL trades to see what's being counted
+    console.log('[entry][concentration][check]', JSON.stringify({
+      proposal_id: proposal.id,
+      symbol: proposal.symbol,
+      strategy: proposal.strategy,
+      option_side: optionSide,
+      total_open_trades_in_db: openTradesForConcentration.length,
+      existing_spreads_count: existingSpreadsForSymbol.length,
+      max_spreads_per_symbol: maxSpreadsPerSymbol,
+      would_block: existingSpreadsForSymbol.length >= maxSpreadsPerSymbol,
+      existing_spreads: existingSpreadsForSymbol.map(t => ({
+        id: t.id,
+        strategy: t.strategy || 'MISSING',
+        status: t.status,
+        quantity: t.quantity || 1,
+        short_strike: t.short_strike,
+        long_strike: t.long_strike,
+        expiration: t.expiration,
+      })),
+      trades_without_strategy: existingSpreadsForSymbol.filter(t => !t.strategy).length,
+      note: 'This is the initial check - will re-check immediately before trade creation to prevent race conditions',
+    }));
+    
     if (existingSpreadsForSymbol.length >= maxSpreadsPerSymbol) {
       console.log('[entry][risk][rejected]', JSON.stringify({
         proposal_id: proposal.id,
@@ -229,6 +283,15 @@ export async function attemptEntryForLatestProposal(
         max_spreads_per_symbol: maxSpreadsPerSymbol,
       }));
       await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+      await insertSystemLog(env, 'entry', '[entry][proposal][invalidated]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        strategy: proposal.strategy,
+        reason: `Symbol ${proposal.symbol} concentration limit reached (${existingSpreadsForSymbol.length}/${maxSpreadsPerSymbol})`,
+        existing_spreads_count: existingSpreadsForSymbol.length,
+        max_spreads_per_symbol: maxSpreadsPerSymbol,
+        timestamp: now.toISOString(),
+      }));
       return { trade: null, reason: `Symbol ${proposal.symbol} concentration limit reached (${existingSpreadsForSymbol.length}/${maxSpreadsPerSymbol})` };
     }
     
@@ -241,14 +304,47 @@ export async function attemptEntryForLatestProposal(
     // Sum quantity for existing trades with same symbol and same side
     // For puts: check if strategy is put-based and same short/long direction
     // For calls: check if strategy is call-based and same short/long direction
+    // NOTE: If trade.strategy is missing, we can't determine the side, so skip it
     const existingQtyForSide = existingSpreadsForSymbol
       .filter(t => {
+        // Skip trades without strategy (they can't be properly classified)
+        if (!t.strategy) {
+          console.warn('[entry][concentration][missing-strategy]', JSON.stringify({
+            trade_id: t.id,
+            symbol: t.symbol,
+            note: 'Trade missing strategy field - cannot determine option side for concentration check',
+          }));
+          return false;
+        }
         const tIsPutStrategy = t.strategy === 'BULL_PUT_CREDIT' || t.strategy === 'BEAR_PUT_DEBIT';
         const tIsShortPremium = t.strategy === 'BULL_PUT_CREDIT' || t.strategy === 'BEAR_CALL_CREDIT';
         const tOptionSide = tIsPutStrategy ? (tIsShortPremium ? 'short_puts' : 'long_puts') : (tIsShortPremium ? 'short_calls' : 'long_calls');
         return tOptionSide === optionSide;
       })
       .reduce((sum, t) => sum + (t.quantity || 1), 0);
+    
+    // Log quantity check for debugging
+    console.log('[entry][concentration][qty-check]', JSON.stringify({
+      proposal_id: proposal.id,
+      symbol: proposal.symbol,
+      option_side: optionSide,
+      existing_qty_for_side: existingQtyForSide,
+      new_qty: quantity,
+      total_would_be: existingQtyForSide + quantity,
+      max_qty_per_symbol_per_side: maxQtyPerSymbolPerSide,
+      matching_trades: existingSpreadsForSymbol
+        .filter(t => {
+          const tIsPutStrategy = t.strategy === 'BULL_PUT_CREDIT' || t.strategy === 'BEAR_PUT_DEBIT';
+          const tIsShortPremium = t.strategy === 'BULL_PUT_CREDIT' || t.strategy === 'BEAR_CALL_CREDIT';
+          const tOptionSide = tIsPutStrategy ? (tIsShortPremium ? 'short_puts' : 'long_puts') : (tIsShortPremium ? 'short_calls' : 'long_calls');
+          return tOptionSide === optionSide;
+        })
+        .map(t => ({
+          id: t.id,
+          strategy: t.strategy,
+          quantity: t.quantity,
+        })),
+    }));
     
     if (existingQtyForSide + quantity > maxQtyPerSymbolPerSide) {
       console.log('[entry][risk][rejected]', JSON.stringify({
@@ -262,11 +358,25 @@ export async function attemptEntryForLatestProposal(
         max_qty_per_symbol_per_side: maxQtyPerSymbolPerSide,
       }));
       await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+      await insertSystemLog(env, 'entry', '[entry][proposal][invalidated]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        strategy: proposal.strategy,
+        reason: `Symbol ${proposal.symbol} ${optionSide} quantity limit reached (${existingQtyForSide + quantity}/${maxQtyPerSymbolPerSide})`,
+        option_side: optionSide,
+        existing_qty: existingQtyForSide,
+        new_qty: quantity,
+        max_qty_per_symbol_per_side: maxQtyPerSymbolPerSide,
+        timestamp: now.toISOString(),
+      }));
       return { trade: null, reason: `Symbol ${proposal.symbol} ${optionSide} quantity limit reached (${existingQtyForSide + quantity}/${maxQtyPerSymbolPerSide})` };
     }
     
-    // 3.1c. Check for duplicate spread (same symbol, strategy, expiration, strikes)
-    // If found, we could merge into existing trade, but for now we'll just reject duplicates
+    // 3.1c. Duplicate spread check REMOVED
+    // Previously rejected proposals with identical spreads (same symbol, strategy, expiration, strikes)
+    // This restriction has been removed to allow quality trades to proceed even if a similar spread exists
+    // The system will still respect MAX_SPREADS_PER_SYMBOL and MAX_QTY_PER_SYMBOL_PER_SIDE limits above
+    // Log for visibility but allow the trade to proceed
     const duplicateSpread = existingSpreadsForSymbol.find(t =>
       t.strategy === proposal.strategy &&
       t.expiration === proposal.expiration &&
@@ -276,43 +386,20 @@ export async function attemptEntryForLatestProposal(
     );
     
     if (duplicateSpread) {
-      // Check if we can increase quantity on existing spread instead of creating duplicate
-      const maxQtyPerSpread = parseInt(
-        (await getSetting(env, 'MAX_QTY_PER_SPREAD')) || '10',
-        10
-      ) || 10;
-      const currentQty = duplicateSpread.quantity || 1;
-      
-      if (currentQty + quantity <= maxQtyPerSpread) {
-        // We could merge here, but for now we'll just reject to keep it simple
-        // TODO: Implement merge logic to increase quantity on existing trade
-        console.log('[entry][risk][rejected]', JSON.stringify({
-          proposal_id: proposal.id,
-          reason: `Duplicate spread already exists (trade_id: ${duplicateSpread.id}, qty: ${currentQty})`,
-          symbol: proposal.symbol,
-          strategy: proposal.strategy,
-          expiration: proposal.expiration,
-          short_strike: proposal.short_strike,
-          long_strike: proposal.long_strike,
-          existing_trade_id: duplicateSpread.id,
-          existing_qty: currentQty,
-          note: 'Merging duplicate spreads not yet implemented - rejecting to prevent over-concentration',
-        }));
-        await updateProposalStatus(env, proposal.id, 'INVALIDATED');
-        return { trade: null, reason: `Duplicate spread already exists (trade ${duplicateSpread.id})` };
-      } else {
-        // Existing spread is already at max quantity
-        console.log('[entry][risk][rejected]', JSON.stringify({
-          proposal_id: proposal.id,
-          reason: `Duplicate spread exists and is at max quantity (${currentQty}/${maxQtyPerSpread})`,
-          symbol: proposal.symbol,
-          existing_trade_id: duplicateSpread.id,
-          existing_qty: currentQty,
-          max_qty_per_spread: maxQtyPerSpread,
-        }));
-        await updateProposalStatus(env, proposal.id, 'INVALIDATED');
-        return { trade: null, reason: `Duplicate spread at max quantity (${currentQty}/${maxQtyPerSpread})` };
-      }
+      // Log for visibility but allow the trade to proceed
+      console.log('[entry][duplicate-spread][allowed]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        strategy: proposal.strategy,
+        expiration: proposal.expiration,
+        short_strike: proposal.short_strike,
+        long_strike: proposal.long_strike,
+        existing_trade_id: duplicateSpread.id,
+        existing_qty: duplicateSpread.quantity || 1,
+        new_qty: quantity,
+        note: 'Duplicate spread check removed - allowing quality trades to proceed',
+      }));
+      // Continue to trade creation - duplicate spread restriction removed
     }
     
     const isDebitSpreadForRisk = proposal.strategy === 'BULL_CALL_DEBIT' || proposal.strategy === 'BEAR_PUT_DEBIT';
@@ -545,7 +632,21 @@ export async function attemptEntryForLatestProposal(
         maxDelta,
       }));
       await updateProposalStatus(env, proposal.id, 'INVALIDATED');
-      return { trade: null, reason: priceDriftCheck.reason };
+      await insertSystemLog(env, 'entry', '[entry][proposal][invalidated]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        strategy: proposal.strategy,
+        reason: priceDriftCheck.reason || 'Price drift check failed',
+        price_drift_details: {
+          credit: priceDriftCheck.credit,
+          min_credit: minCredit,
+          delta: priceDriftCheck.delta,
+          min_delta: minDelta,
+          max_delta: maxDelta,
+        },
+        timestamp: now.toISOString(),
+      }));
+      return { trade: null, reason: priceDriftCheck.reason || 'Price drift check failed' };
     }
     
     console.log('[entry][price_drift_check][passed]', JSON.stringify({
@@ -576,6 +677,16 @@ export async function attemptEntryForLatestProposal(
         reason: 'Cannot find option legs in chain after price drift check',
       }));
       await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+      await insertSystemLog(env, 'entry', '[entry][proposal][invalidated]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        strategy: proposal.strategy,
+        reason: 'Cannot find option legs in chain',
+        option_type: optionType,
+        short_strike: proposal.short_strike,
+        long_strike: proposal.long_strike,
+        timestamp: now.toISOString(),
+      }));
       return { trade: null, reason: 'Cannot find option legs in chain' };
     }
     
@@ -622,6 +733,57 @@ export async function attemptEntryForLatestProposal(
     }
     
     // 9. Place order (SANDBOX_PAPER or LIVE)
+    // CRITICAL: Validate strategy matches option type before placing order
+    const proposalIsCallStrategy = proposal.strategy === 'BEAR_CALL_CREDIT' || proposal.strategy === 'BULL_CALL_DEBIT';
+    const proposalIsPutStrategy = proposal.strategy === 'BULL_PUT_CREDIT' || proposal.strategy === 'BEAR_PUT_DEBIT';
+    const actualOptionType = shortOption.type; // 'call' or 'put'
+    
+    if (proposalIsCallStrategy && actualOptionType !== 'call') {
+      const error = `Strategy mismatch: proposal.strategy=${proposal.strategy} (expects calls) but option type=${actualOptionType}`;
+      console.error('[entry][strategy-mismatch]', JSON.stringify({
+        proposal_id: proposal.id,
+        strategy: proposal.strategy,
+        actual_option_type: actualOptionType,
+        short_strike: proposal.short_strike,
+        long_strike: proposal.long_strike,
+        error,
+      }));
+      await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+      await insertSystemLog(env, 'entry', '[entry][proposal][invalidated]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        strategy: proposal.strategy,
+        reason: error,
+        error_type: 'strategy_mismatch',
+        actual_option_type: actualOptionType,
+        timestamp: now.toISOString(),
+      }));
+      return { trade: null, reason: error };
+    }
+    
+    if (proposalIsPutStrategy && actualOptionType !== 'put') {
+      const error = `Strategy mismatch: proposal.strategy=${proposal.strategy} (expects puts) but option type=${actualOptionType}`;
+      console.error('[entry][strategy-mismatch]', JSON.stringify({
+        proposal_id: proposal.id,
+        strategy: proposal.strategy,
+        actual_option_type: actualOptionType,
+        short_strike: proposal.short_strike,
+        long_strike: proposal.long_strike,
+        error,
+      }));
+      await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+      await insertSystemLog(env, 'entry', '[entry][proposal][invalidated]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        strategy: proposal.strategy,
+        reason: error,
+        error_type: 'strategy_mismatch',
+        actual_option_type: actualOptionType,
+        timestamp: now.toISOString(),
+      }));
+      return { trade: null, reason: error };
+    }
+    
     // Determine if this is a debit spread
     const isDebitSpread = proposal.strategy === 'BULL_CALL_DEBIT' || proposal.strategy === 'BEAR_PUT_DEBIT';
     
@@ -661,6 +823,32 @@ export async function attemptEntryForLatestProposal(
       };
     }
     
+    // CRITICAL: Verify order construction matches strategy invariants
+    // This ensures short_strike/long_strike are correctly mapped to legs
+    const { checkStrategyInvariants } = await import('../core/strategyInvariants');
+    const tradeForValidation: Omit<TradeRow, 'id' | 'created_at' | 'updated_at' | 'proposal_id' | 'broker_order_id_open' | 'broker_order_id_close' | 'opened_at' | 'closed_at' | 'status' | 'exit_reason' | 'entry_price' | 'exit_price' | 'max_profit' | 'max_loss' | 'realized_pnl' | 'max_seen_profit_fraction' | 'iv_entry' | 'origin' | 'managed'> = {
+      symbol: proposal.symbol,
+      expiration: proposal.expiration,
+      short_strike: proposal.short_strike,
+      long_strike: proposal.long_strike,
+      width: proposal.width,
+      quantity: proposal.quantity ?? 1,
+      strategy: proposal.strategy,
+    };
+    const invariantCheck = checkStrategyInvariants(tradeForValidation as TradeRow);
+    if (!invariantCheck.ok) {
+      const errorMsg = `Strategy invariant violation before order placement: ${invariantCheck.violations.join(', ')}`;
+      console.error('[entry][strategy][invariant-violation]', JSON.stringify({
+        proposal_id: proposal.id,
+        strategy: proposal.strategy,
+        short_strike: proposal.short_strike,
+        long_strike: proposal.long_strike,
+        width: proposal.width,
+        violations: invariantCheck.violations,
+      }));
+      throw new Error(errorMsg);
+    }
+    
     const orderDetails = {
       symbol: proposal.symbol,
       expiration: proposal.expiration,
@@ -673,11 +861,19 @@ export async function attemptEntryForLatestProposal(
       long_option_symbol: longOption.symbol,
       leg0: { option_symbol: leg0.option_symbol, side: leg0.side },
       leg1: { option_symbol: leg1.option_symbol, side: leg1.side },
+      invariant_check: 'PASSED', // Log that invariants were verified
     };
-    console.log('[entry] placing order', JSON.stringify(orderDetails));
+    console.log('[entry][strategy][order_build]', JSON.stringify(orderDetails));
     
     // Also save to system_logs for debug endpoint
     await insertSystemLog(env, 'entry', '[entry] placing order', JSON.stringify(orderDetails));
+    
+    // Generate client_order_id for explicit linkage
+    const { generateClientOrderId, createOrderRecord } = await import('./orderHelpers');
+    const clientOrderId = generateClientOrderId(proposal.id, 'ENTRY');
+    
+    // Create order record BEFORE placing order (so we have it even if order fails)
+    const orderRecordId = await createOrderRecord(env, proposal, 'ENTRY', clientOrderId);
     
     const order = await broker.placeSpreadOrder({
       symbol: proposal.symbol,
@@ -686,11 +882,207 @@ export async function attemptEntryForLatestProposal(
       legs: [leg0, leg1],
       tag: 'GEKKOWORKS-ENTRY',
       strategy: proposal.strategy,
+      client_order_id: clientOrderId,
     });
+    
+    // Update order record with Tradier order ID
+    const { updateOrderWithTradierResponse } = await import('./orderHelpers');
+    await updateOrderWithTradierResponse(env, clientOrderId, order.id, 'PLACED');
+    
+    // CRITICAL: Immediately sync order status from Tradier to catch fills/rejections
+    try {
+      const { syncSingleOrderFromTradier } = await import('./orderSyncNew');
+      await syncSingleOrderFromTradier(env, order.id, clientOrderId);
+    } catch (syncError) {
+      console.warn('[entry][order][immediate-sync-error]', JSON.stringify({
+        proposal_id: proposal.id,
+        order_id: order.id,
+        error: syncError instanceof Error ? syncError.message : String(syncError),
+        note: 'Will be synced on next monitor cycle',
+      }));
+    }
     
     console.log('[entry] order placed successfully', JSON.stringify({
       orderId: order.id,
       status: order.status,
+    }));
+    
+    // CRITICAL: Re-check concentration limits IMMEDIATELY before creating trade
+    // This prevents race conditions where multiple cycles pass the initial check
+    // and all create trades simultaneously
+    const { getOpenTrades: getOpenTradesForFinalCheck } = await import('../db/queries');
+    const openTradesForFinalCheck = await getOpenTradesForFinalCheck(env);
+    // CRITICAL: EXCLUDE CLOSING_PENDING trades from final check - they are closing and shouldn't block new entries
+    const existingSpreadsForSymbolFinal = openTradesForFinalCheck.filter(t => 
+      t.symbol === proposal.symbol &&
+      t.status !== 'CANCELLED' &&
+      t.status !== 'CLOSED' &&
+      t.status !== 'EXIT_ERROR' &&
+      t.status !== 'CLOSING_PENDING' // Exclude trades that are closing
+    );
+    
+    const maxSpreadsPerSymbolFinal = parseInt(
+      (await getSetting(env, 'MAX_SPREADS_PER_SYMBOL')) || '3',
+      10
+    ) || 3;
+    
+    // Also check total quantity per symbol (additional safeguard)
+    const maxTotalQtyPerSymbol = parseInt(
+      (await getSetting(env, 'MAX_TOTAL_QTY_PER_SYMBOL')) || '50',
+      10
+    ) || 50; // Default: 50 contracts total per symbol
+    const totalQtyForSymbol = existingSpreadsForSymbolFinal.reduce((sum, t) => sum + (t.quantity || 1), 0);
+    const totalQtyAfterNewTrade = totalQtyForSymbol + quantity;
+    
+    if (existingSpreadsForSymbolFinal.length >= maxSpreadsPerSymbolFinal) {
+      // Concentration limit reached between initial check and trade creation
+      // Cancel the order and reject the entry
+      console.error('[entry][concentration][race-condition-detected][spread-count]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        order_id: order.id,
+        existing_spreads_count: existingSpreadsForSymbolFinal.length,
+        max_spreads_per_symbol: maxSpreadsPerSymbolFinal,
+        note: 'Concentration limit reached between initial check and trade creation - cancelling order',
+      }));
+      
+      try {
+        await broker.cancelOrder(order.id);
+        console.log('[entry][concentration][order-cancelled]', JSON.stringify({
+          order_id: order.id,
+          symbol: proposal.symbol,
+        }));
+      } catch (cancelError) {
+        console.error('[entry][concentration][cancel-failed]', JSON.stringify({
+          order_id: order.id,
+          error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+        }));
+      }
+      
+      await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+      await insertSystemLog(env, 'entry', '[entry][proposal][invalidated]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        strategy: proposal.strategy,
+        reason: `Concentration limit reached for ${proposal.symbol} (${existingSpreadsForSymbolFinal.length}/${maxSpreadsPerSymbolFinal} spreads) - order cancelled`,
+        existing_spreads_count: existingSpreadsForSymbolFinal.length,
+        max_spreads_per_symbol: maxSpreadsPerSymbolFinal,
+        order_id: order.id,
+        timestamp: now.toISOString(),
+      }));
+      return { 
+        trade: null, 
+        reason: `Concentration limit reached for ${proposal.symbol} (${existingSpreadsForSymbolFinal.length}/${maxSpreadsPerSymbolFinal} spreads) - order cancelled` 
+      };
+    }
+    
+    if (totalQtyAfterNewTrade > maxTotalQtyPerSymbol) {
+      // Total quantity limit reached - cancel the order
+      console.error('[entry][concentration][race-condition-detected][total-qty]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        order_id: order.id,
+        existing_total_qty: totalQtyForSymbol,
+        new_qty: quantity,
+        total_qty_after: totalQtyAfterNewTrade,
+        max_total_qty_per_symbol: maxTotalQtyPerSymbol,
+        note: 'Total quantity limit reached between initial check and trade creation - cancelling order',
+      }));
+      
+      try {
+        await broker.cancelOrder(order.id);
+        console.log('[entry][concentration][order-cancelled][qty-limit]', JSON.stringify({
+          order_id: order.id,
+          symbol: proposal.symbol,
+        }));
+      } catch (cancelError) {
+        console.error('[entry][concentration][cancel-failed]', JSON.stringify({
+          order_id: order.id,
+          error: cancelError instanceof Error ? cancelError.message : String(cancelError),
+        }));
+      }
+      
+      await updateProposalStatus(env, proposal.id, 'INVALIDATED');
+      await insertSystemLog(env, 'entry', '[entry][proposal][invalidated]', JSON.stringify({
+        proposal_id: proposal.id,
+        symbol: proposal.symbol,
+        strategy: proposal.strategy,
+        reason: `Total quantity limit reached for ${proposal.symbol} (${totalQtyAfterNewTrade}/${maxTotalQtyPerSymbol} contracts) - order cancelled`,
+        existing_total_qty: totalQtyForSymbol,
+        new_qty: quantity,
+        total_would_be: totalQtyAfterNewTrade,
+        max_total_qty_per_symbol: maxTotalQtyPerSymbol,
+        order_id: order.id,
+        timestamp: now.toISOString(),
+      }));
+      return { 
+        trade: null, 
+        reason: `Total quantity limit reached for ${proposal.symbol} (${totalQtyAfterNewTrade}/${maxTotalQtyPerSymbol} contracts) - order cancelled`
+      };
+    }
+    
+    // CRITICAL: Create trade IMMEDIATELY after placing order to persist order ID
+    // This ensures we capture the order ID even if the process crashes during polling
+    // The trade will be updated to OPEN status after fill confirmation
+    // CRITICAL VALIDATION: Ensure proposal has all required fields
+    if (!proposal.id) {
+      throw new Error(`Proposal ${proposal.id} missing id`);
+    }
+    if (!proposal.strategy) {
+      throw new Error(`Proposal ${proposal.id} missing strategy`);
+    }
+    
+    const trade: Omit<TradeRow, 'created_at' | 'updated_at'> = {
+      id: crypto.randomUUID(),
+      proposal_id: proposal.id, // CRITICAL: Must always be populated
+      symbol: proposal.symbol,
+      expiration: proposal.expiration,
+      short_strike: proposal.short_strike,
+      long_strike: proposal.long_strike,
+      width: proposal.width,
+      quantity: proposal.quantity ?? 1, // Will be updated with filled quantity after fill
+      entry_price: null, // Will be set by markTradeOpen after fill
+      exit_price: null,
+      max_profit: null, // Will be calculated by markTradeOpen
+      max_loss: null, // Will be calculated by markTradeOpen
+      status: 'ENTRY_PENDING',
+      exit_reason: null,
+      broker_order_id_open: order.id, // CRITICAL: Must use Tradier order ID
+      broker_order_id_close: null,
+      opened_at: null,
+      closed_at: null,
+      realized_pnl: null,
+      strategy: proposal.strategy, // CRITICAL: Must match proposal strategy exactly
+      origin: 'ENGINE', // CRITICAL: All engine-created trades must have origin='ENGINE'
+      managed: 1, // CRITICAL: All engine-created trades must have managed=1
+    };
+    
+    // CRITICAL VALIDATION: Ensure trade has all required fields before inserting
+    if (!trade.proposal_id) {
+      throw new Error(`Trade creation failed: proposal_id is required but was null`);
+    }
+    if (!trade.strategy) {
+      throw new Error(`Trade creation failed: strategy is required but was null`);
+    }
+    if (trade.strategy !== proposal.strategy) {
+      throw new Error(`Trade creation failed: strategy mismatch - trade has ${trade.strategy}, proposal has ${proposal.strategy}`);
+    }
+    if (!trade.broker_order_id_open) {
+      throw new Error(`Trade creation failed: broker_order_id_open is required but was null`);
+    }
+    
+    const persistedTrade = await insertTrade(env, trade);
+    
+    // Link order to trade
+    const { linkOrderToTrade } = await import('./orderHelpers');
+    await linkOrderToTrade(env, clientOrderId, persistedTrade.id);
+    
+    console.log('[entry] trade created with order ID', JSON.stringify({
+      tradeId: persistedTrade.id,
+      orderId: order.id,
+      clientOrderId: clientOrderId,
+      status: 'ENTRY_PENDING',
+      note: 'Order ID persisted immediately - will update to OPEN after fill confirmation',
     }));
     
     // 9.5. Poll for fill with strict timeout (per Tradier-first spec)
@@ -704,49 +1096,33 @@ export async function attemptEntryForLatestProposal(
     );
     
     if (!pollResult.filled) {
-      // Timeout or error - cancel order and mark trade as FAILED
+      // Timeout or error - cancel order and update trade status
       try {
         await broker.cancelOrder(order.id);
         console.log('[entry] order cancelled due to timeout', JSON.stringify({
           orderId: order.id,
+          tradeId: persistedTrade.id,
           reason: pollResult.reason,
         }));
       } catch (cancelError) {
         console.error('[entry] failed to cancel order', JSON.stringify({
           orderId: order.id,
+          tradeId: persistedTrade.id,
           error: cancelError instanceof Error ? cancelError.message : String(cancelError),
         }));
       }
       
-      // Create trade row with FAILED status
-      const failedTrade: Omit<TradeRow, 'created_at' | 'updated_at'> = {
-        id: crypto.randomUUID(),
-        proposal_id: proposal.id,
-        symbol: proposal.symbol,
-        expiration: proposal.expiration,
-        short_strike: proposal.short_strike,
-        long_strike: proposal.long_strike,
-        width: proposal.width,
-        quantity: proposal.quantity ?? 1,
-        entry_price: null,
-        exit_price: null,
-        max_profit: null,
-        max_loss: null,
+      // Update existing trade to CANCELLED status
+      const { updateTrade } = await import('../db/queries');
+      const cancelledTrade = await updateTrade(env, persistedTrade.id, {
         status: 'CANCELLED',
         exit_reason: (pollResult.reason || 'ENTRY_TIMEOUT') as any, // Entry failures use string reasons, not ExitReason enum
-        broker_order_id_open: order.id,
-        broker_order_id_close: null,
-        opened_at: null,
-        closed_at: null,
-        realized_pnl: null,
-        strategy: proposal.strategy,
-      };
+      });
       
-      const persistedTrade = await insertTrade(env, failedTrade);
       await updateProposalStatus(env, proposal.id, 'CONSUMED');
       
       return {
-        trade: persistedTrade,
+        trade: cancelledTrade,
         reason: `Order timeout: ${pollResult.reason}`,
       };
     }
@@ -754,35 +1130,17 @@ export async function attemptEntryForLatestProposal(
     // Order filled - get final order details and re-sync from Tradier
     const finalOrder = await broker.getOrder(order.id);
     if (!finalOrder.avg_fill_price || finalOrder.avg_fill_price <= 0) {
-      // Data error - mark as failed
-      const failedTrade: Omit<TradeRow, 'created_at' | 'updated_at'> = {
-        id: crypto.randomUUID(),
-        proposal_id: proposal.id,
-        symbol: proposal.symbol,
-        expiration: proposal.expiration,
-        short_strike: proposal.short_strike,
-        long_strike: proposal.long_strike,
-        width: proposal.width,
-        quantity: proposal.quantity ?? 1,
-        entry_price: null,
-        exit_price: null,
-        max_profit: null,
-        max_loss: null,
+      // Data error - update trade to CANCELLED
+      const { updateTrade } = await import('../db/queries');
+      const failedTrade = await updateTrade(env, persistedTrade.id, {
         status: 'CANCELLED',
         exit_reason: 'FILL_PRICE_MISSING' as any, // Entry failure reason, not ExitReason enum
-        broker_order_id_open: order.id,
-        broker_order_id_close: null,
-        opened_at: null,
-        closed_at: null,
-        realized_pnl: null,
-        strategy: proposal.strategy,
-      };
+      });
       
-      const persistedTrade = await insertTrade(env, failedTrade);
       await updateProposalStatus(env, proposal.id, 'CONSUMED');
       
       return {
-        trade: persistedTrade,
+        trade: failedTrade,
         reason: 'Order filled but fill price missing',
       };
     }
@@ -792,9 +1150,18 @@ export async function attemptEntryForLatestProposal(
         ? finalOrder.filled_quantity
         : (proposal.quantity ?? 1);
     
+    // Update quantity if it changed (shouldn't happen, but handle gracefully)
+    if (filledQuantity !== persistedTrade.quantity) {
+      const { updateTrade } = await import('../db/queries');
+      await updateTrade(env, persistedTrade.id, {
+        quantity: filledQuantity,
+      });
+    }
+    
     // Immediately re-sync from Tradier before marking trade OPEN (per spec)
     console.log('[entry] order filled, re-syncing from Tradier', JSON.stringify({
       orderId: order.id,
+      tradeId: persistedTrade.id,
       fillPrice: finalOrder.avg_fill_price,
     }));
     
@@ -805,34 +1172,8 @@ export async function attemptEntryForLatestProposal(
     await syncPortfolioFromTradier(env);
     await syncOrdersFromTradier(env);
     await syncBalancesFromTradier(env);
-    
-    // 10. Create trade row with ENTRY_PENDING status (will be marked OPEN below)
-    const trade: Omit<TradeRow, 'created_at' | 'updated_at'> = {
-      id: crypto.randomUUID(),
-      proposal_id: proposal.id,
-      symbol: proposal.symbol,
-      expiration: proposal.expiration,
-      short_strike: proposal.short_strike,
-      long_strike: proposal.long_strike,
-      width: proposal.width,
-      quantity: filledQuantity,
-      entry_price: null, // Will be set by markTradeOpen
-      exit_price: null,
-      max_profit: null, // Will be calculated by markTradeOpen
-      max_loss: null, // Will be calculated by markTradeOpen
-      status: 'ENTRY_PENDING',
-      exit_reason: null,
-      broker_order_id_open: order.id,
-      broker_order_id_close: null,
-      opened_at: null,
-      closed_at: null,
-      realized_pnl: null,
-      strategy: proposal.strategy,
-    };
-    
-    const persistedTrade = await insertTrade(env, trade);
-    console.log('[entry] trade inserted, marking as OPEN', JSON.stringify({
-      id: persistedTrade.id,
+    console.log('[entry] marking trade as OPEN', JSON.stringify({
+      tradeId: persistedTrade.id,
       orderId: order.id,
       fillPrice: finalOrder.avg_fill_price,
     }));
@@ -840,11 +1181,11 @@ export async function attemptEntryForLatestProposal(
     // Get IV at entry for IV crush exit logic
     let ivEntry: number | null = null;
     try {
-      const optionChain = await broker.getOptionChain(trade.symbol, trade.expiration);
+      const optionChain = await broker.getOptionChain(persistedTrade.symbol, persistedTrade.expiration);
       // Determine option type based on strategy
-      const optionType = (trade.strategy === 'BEAR_CALL_CREDIT' || trade.strategy === 'BULL_CALL_DEBIT') ? 'call' : 'put';
+      const optionType = (persistedTrade.strategy === 'BEAR_CALL_CREDIT' || persistedTrade.strategy === 'BULL_CALL_DEBIT') ? 'call' : 'put';
       const shortOption = optionChain.find(
-        opt => opt.strike === trade.short_strike && opt.type === optionType
+        opt => opt.strike === persistedTrade.short_strike && opt.type === optionType
       );
       if (shortOption && shortOption.implied_volatility) {
         ivEntry = shortOption.implied_volatility;
@@ -858,6 +1199,7 @@ export async function attemptEntryForLatestProposal(
     }
     
     // Mark trade as OPEN with fill price from Tradier
+    // The trade already has broker_order_id_open set, so it will persist through the lifecycle
     const openedTrade = await markTradeOpen(
       env,
       persistedTrade.id,
@@ -871,7 +1213,7 @@ export async function attemptEntryForLatestProposal(
     // 11. Mark proposal as consumed
     await updateProposalStatus(env, proposal.id, 'CONSUMED');
     
-    return { trade: openedTrade };
+    return { trade: openedTrade, reason: 'Trade opened successfully' };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('[entry] attemptEntryForLatestProposal error', JSON.stringify({

@@ -37,6 +37,18 @@ export default function Layout() {
                 >
                   Proposals & Orders
                 </Link>
+                <Link
+                  to="/portfolio"
+                  className="border-transparent text-gray-500 hover:border-gray-300 hover:text-gray-700 inline-flex items-center px-1 pt-1 border-b-2 text-sm font-medium"
+                >
+                  Portfolio
+                </Link>
+                <Link
+                  to="/daily-summary"
+                  className="border-transparent text-gray-500 hover:border-gray-300 hover:text-gray-700 inline-flex items-center px-1 pt-1 border-b-2 text-sm font-medium"
+                >
+                  Daily Summary
+                </Link>
               </div>
             </div>
           </div>

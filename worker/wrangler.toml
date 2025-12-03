@@ -1,6 +1,7 @@
 name = "gekkoworks-api"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
 [vars]
@@ -46,5 +47,8 @@ crons = [
   "0 14 * * MON-FRI",
   "0 17 * * MON-FRI",
   "0 20 * * MON-FRI",
+  
+  # Daily activity summary – runs at 4:15 PM ET (20:15 UTC) to generate end-of-day summary
+  "15 20 * * MON-FRI",
 ]
 
